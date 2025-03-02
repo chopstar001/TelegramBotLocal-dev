@@ -6,3 +6,4 @@ export { PatternPromptAgent } from './PatternPromptAgent';
 export { ConversationAgent } from './ConversationAgent';
 export { GameAgent } from './GameAgent';
 export { AgentFactory } from './AgentFactory';
+export { ToolManager } from '../ToolManager';

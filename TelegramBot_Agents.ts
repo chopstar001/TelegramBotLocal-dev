@@ -28,6 +28,7 @@ import { MemoryType, BotInfo, IExtendedMemory, ExtendedIMessage, IUpdateMemory, 
 import { messageContentToString } from './utils/utils';
 import { addImagesToMessages, llmSupportsVision } from '../../../src/multiModalUtils';
 import ToolManager from './ToolManager';
+import { YouTubeTool } from './tools/YouTubeTool';
 import PromptManager from './PromptManager';
 import { AgentManager } from './AgentManager';
 import { ContextAdapter } from './ContextAdapter';
@@ -634,18 +635,6 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
             this.gameSystemPrompt = nodeData.inputs?.gameSystemPrompt as string || PromptManager.defaultGameSystemPrompt();
 
-            // Extract tools from nodeData.inputs.tools
-            const tools: Tool[] = nodeData.inputs?.tools as Tool[] || [];
-
-            if (tools.length === 0) {
-                logWarn('performInitialization', 'No tools provided in nodeData.inputs.tools. Initializing with an empty array.');
-            } else {
-                logInfo('performInitialization', `Tools provided: ${tools.map(tool => tool.name).join(', ')}`);
-            }
-
-            // Initialize ToolManager with the extracted tools
-            this.toolManager = new ToolManager(tools);
-
             // Initialize other parameters
             const removeDisclaimersRAG = nodeData.inputs?.removeDisclaimersRAG as boolean ?? false; // Set to false by default
             const maxMessageLength = nodeData.inputs?.maxMessageLength as number || 4000;
@@ -658,7 +647,21 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             const welcomeMessage = nodeData.inputs?.welcomeMessage as string || 'Welcome! How can I assist you today?';
             const idleTimeout = nodeData.inputs?.idleTimeout as number || 300;
             const toolAgentSystemPrompt = nodeData.inputs?.toolAgentSystemPrompt as string || PromptManager.defaultToolAgentSystemPrompt();
+            
+            // Initialize ToolManager first, before any agents
+            console.log("Initializing ToolManager...");
+            const tools: Tool[] = nodeData.inputs?.tools as Tool[] || [];
+            this.toolManager = new ToolManager(tools);
+            // Extract tools from nodeData.inputs.tools
 
+            if (tools.length === 0) {
+                logWarn('performInitialization', 'No tools provided in nodeData.inputs.tools. Initializing with an empty array.');
+            } else {
+                logInfo('performInitialization', `Tools provided: ${tools.map(tool => tool.name).join(', ')}`);
+            }
+            const availableTools = this.toolManager.getToolNames();
+            console.log(`[${this.flowId}] Available tools: ${availableTools.join(', ') || 'none'}`);
+            
             this.agentManager = new AgentManager(this.flowId, this.toolManager, this.promptManager);
 
             this.menuManager = new MenuManager(this, this.flowId); // Pass flowId as string
@@ -799,24 +802,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 this.promptManager,
                 removeDisclaimersRAG
             );
-            if (this.agentManager) {
-                if (!this) {
-                    console.warn('TelegramBot not initialized when creating GameAgent');
-                    return;
-                }
-                const toolManager = this.getToolManager();
-                if (!toolManager) {
-                    console.warn('ToolManager not available when creating GameAgent');
-                    return;
-                }
-                const gameAgent = new GameAgent(
-                    this.flowId,
-                    this.conversationManager,
-                    toolManager,
-                    this.promptManager
-                );
-                this.agentManager.registerAgent('game', gameAgent);
-            }
+
             // Initialize AgentManager
             // In TelegramBot_Agents constructor or initialization
             this.agentManager.setTelegramBot(this);  // Important: Set the telegram bot reference
@@ -867,7 +853,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             // Initialize Telegram bot
             if (!this.bot) {
                 this.bot = new Telegraf<Context>(this.botToken, {
-                    handlerTimeout: 400000 // 4 minutes in milliseconds
+                    handlerTimeout: 600000 // 4 minutes in milliseconds
                 });
 
                 try {
@@ -919,6 +905,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                     this.promptManager,
                     this.agentManager,
                     this.menuManager,
+                    this.toolManager,
                     this.flowId,
                     {
                         telegramBot: this
@@ -931,7 +918,46 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             } else {
                 throw new Error('Bot or ConversationManager is not initialized. Cannot create CommandHandler.');
             }
+            if (this.agentManager) {
+                if (!this) {
+                    console.warn('TelegramBot not initialized when creating agents');
+                    return;
+                }
 
+                const toolManager = this.getToolManager();
+                if (!toolManager) {
+                    console.warn('ToolManager not available when creating agents');
+                    return;
+                }
+
+
+                // Register YouTube tool if API key is available
+                if (process.env.YOUTUBE_API_KEY) {
+                    const youtubeTool = new YouTubeTool(process.env.YOUTUBE_API_KEY);
+                    this.toolManager.addTool(youtubeTool);
+                    console.log(`[${this.flowId}] YouTube tool registered successfully`);
+                } else {
+                    console.warn(`[${this.flowId}] YouTube API key not found in environment variables, YouTube functionality will be disabled`);
+                }
+
+                // Create and register the game agent
+                const gameAgent = new GameAgent(
+                    this.flowId,
+                    this.conversationManager,
+                    toolManager,
+                    this.promptManager
+                );
+                this.agentManager.registerAgent('game', gameAgent);
+
+                // Create and register the pattern agent
+                const patternAgent = new PatternPromptAgent(
+                    this.flowId,
+                    this.conversationManager,
+                    toolManager,
+                    this.promptManager
+                );
+                this.agentManager.registerAgent('pattern', patternAgent);
+            }
 
             // Set component references
             this.commandHandler.setConversationManager(this.conversationManager);
@@ -2036,6 +2062,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 null as any, // agentManager
                 null as any, // menuManager
                 null as any, // flowId
+                null as any, // toolManager
                 { telegramBot: this }
             );
         }
@@ -2407,6 +2434,36 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             await this.commandHandler?.handlePatternAction(adapter, action, parameter);
             return;
         }
+        // In TelegramBot_Agents.ts handleCallbackQuery method:
+        else if (data.startsWith('yt_')) {
+            const methodName = 'handleCallbackQuery';
+            const match = data.match(/^yt_([^:]+)(?::(.+))?$/);
+            if (!match) {
+                console.warn(`[${methodName}] Invalid YouTube command format:`, data);
+                await adapter.answerCallbackQuery('Invalid YouTube command');
+                return;
+            }
+
+            const action = match[1]; // e.g., 'get'
+            const params = match[2] ? match[2].split(':') : []; // videoId, action
+
+            if (action === 'get' && params.length >= 2) {
+                const videoId = params[0];
+                const youtubeAction = params[1]; // transcript, timestamps, metadata, comments
+                console.log(`[${methodName}] YouTube action: ${action}, videoId: ${videoId}, youtubeAction: ${youtubeAction}`);
+
+                // Make sure CommandHandler is available
+                if (this.commandHandler) {
+                    await this.commandHandler.handleYouTubeAction(adapter, videoId, youtubeAction);
+                } else {
+                    await adapter.reply("Sorry, the YouTube feature is not available right now.");
+                }
+                return;
+            }
+
+            await adapter.answerCallbackQuery('Invalid YouTube action');
+            return;
+        }
 
         else if (data.startsWith('thinking_')) {
             await this.commandHandler.handleThinkingCallback(adapter, data);
@@ -2416,9 +2473,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             await adapter.answerCallbackQuery("I don't know how to handle this action.");
         }
     }
-    private formatCategoryName(category: string): string {
-        return category.charAt(0).toUpperCase() + category.slice(1);
-    }
+
 
     async handleMessage(
         adapter: ContextAdapter,
@@ -2454,7 +2509,9 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
         const message = context.raw.message;
         const chatId = context.chatId;
-
+        if (message.text && await this.checkForYouTubeUrl(message.text, adapter)) {
+            return ''; // YouTube URL detected and handled, don't process further
+        }
         // Get the botKey (chatflowId) from flowIdMap
         const flowIdEntry = Array.from(flowIdMap.entries())
             .find(([_, fId]) => fId === this.flowId);
@@ -2943,6 +3000,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         console.log(`[${methodName}:${this.flowId}] isAI: ${isAI}, isReply: ${isReply}, isFollowUp: ${isFollowUp}`);
 
         try {
+
             // Check game state first
             const gameAgent = this.agentManager.getAgent('game') as GameAgent;
             const gameState = gameAgent?.getGameState?.(userId);
@@ -4000,9 +4058,8 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         const context = adapter.getMessageContext();
         const { userId, sessionId } = await this.conversationManager.getSessionInfo(context);
         // Check if this is a game interaction by looking at game state
-        const gameAgent = this.agentManager?.getAgent('game') as GameAgent;
-        if (gameAgent) {
-            const gameState = gameAgent.getGameState(userId);
+        const gameAgent = this.agentManager.getAgent('game') as GameAgent | undefined; if (gameAgent) {
+            const gameState = gameAgent?.getGameState ? gameAgent.getGameState(userId) : undefined;
             if (gameState && gameState.isActive) {
                 console.log(`[${methodName}] Skipping memory update for active game`);
                 return; // Skip memory update entirely for game interactions
@@ -6056,7 +6113,39 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return null;
         }
     }
+    // Add this to your TelegramBot_Agents class
+    private youtubeUrlPattern = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|(?:s(?:horts)\/)|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]*)/;
 
+    public async checkForYouTubeUrl(input: string, adapter: ContextAdapter): Promise<boolean> {
+        const match = input.match(this.youtubeUrlPattern);
+        if (!match || !match[1]) return false;
+
+        const videoId = match[1];
+        console.log(`Detected YouTube video ID: ${videoId}`);
+
+        try {
+            // Show action menu for YouTube video
+            await adapter.reply("🎬 I noticed a YouTube video link! Would you like me to retrieve data from this video?", {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: "📝 Get Transcript", callback_data: `yt_get:${videoId}:transcript` },
+                            { text: "📊 Get Transcript w/ Timestamps", callback_data: `yt_get:${videoId}:timestamps` }
+                        ],
+                        [
+                            { text: "ℹ️ Get Video Info", callback_data: `yt_get:${videoId}:metadata` },
+                            { text: "💬 Get Comments", callback_data: `yt_get:${videoId}:comments` }
+                        ]
+                    ]
+                }
+            });
+
+            return true; // URL was detected and handled
+        } catch (error) {
+            console.error("Error handling YouTube URL:", error);
+            return false;
+        }
+    }
     private sanitizeMessageContent(content: string): string {
         if (!content) return '';
 

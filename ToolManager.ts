@@ -2,6 +2,8 @@
 
 import { Tool } from '@langchain/core/tools';
 import { logInfo, logError } from './loggingUtility';
+import { YouTubeTool } from './tools/YouTubeTool';
+
 
 
 export class ToolManager {
@@ -51,14 +53,14 @@ export class ToolManager {
     }
     public hasToolForInput(input: string): boolean {
         const lowercaseInput = input.toLowerCase();
-        return Array.from(this.tools.values()).some((tool: Tool) => 
+        return Array.from(this.tools.values()).some((tool: Tool) =>
             this.isToolRelevant(tool, lowercaseInput)
         );
     }
 
     public selectTool(input: string): Tool | null {
         const lowercaseInput = input.toLowerCase();
-        const relevantTool = Array.from(this.tools.values()).find((tool: Tool) => 
+        const relevantTool = Array.from(this.tools.values()).find((tool: Tool) =>
             this.isToolRelevant(tool, lowercaseInput)
         );
         return relevantTool || null;
@@ -67,15 +69,33 @@ export class ToolManager {
     private isToolRelevant(tool: Tool, lowercaseInput: string): boolean {
         const lowercaseName = tool.name.toLowerCase();
         const lowercaseDescription = tool.description.toLowerCase();
+
+        return lowercaseInput.includes(lowercaseName) ||
+            lowercaseDescription.split(' ').some((word: string) =>
+                lowercaseInput.includes(word)
+            );
+    }
+    // ToolManager.ts (add to existing file)
+
+
+    // Inside ToolManager class:
+    public registerYouTubeTool(apiKey: string): void {
+        if (!apiKey) {
+            console.warn('No YouTube API key provided, YouTube tool will not be available');
+            return;
+        }
         
-        return lowercaseInput.includes(lowercaseName) || 
-               lowercaseDescription.split(' ').some((word: string) => 
-                   lowercaseInput.includes(word)
-               );
+        try {
+            const youtubeTool = new YouTubeTool(apiKey);
+            this.addTool(youtubeTool);
+            console.log('YouTube tool registered successfully');
+        } catch (error) {
+            console.error('Error registering YouTube tool:', error);
+        }
     }
     public async cleanup(): Promise<void> {
         console.log(`[ToolManager] Starting cleanup...`);
-        
+
         // Clean up each tool if it has a cleanup method
         for (const [toolName, tool] of this.tools.entries()) {
             if (typeof (tool as any).cleanup === 'function') {

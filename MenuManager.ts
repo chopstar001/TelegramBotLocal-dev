@@ -4,22 +4,6 @@ import { InlineKeyboardMarkup, ReplyKeyboardMarkup, InlineKeyboardButton } from 
 import { Command, BotInfo } from './commands/types';
 import { TelegramBot_Agents } from './TelegramBot_Agents';
 import { ContextAdapter, } from './ContextAdapter';
-import {
-    Question,
-    GameState,
-    GameButtons,
-    GameType,
-    GameConfig,
-    MillionaireState,
-    GameSession,
-    LifelineType,
-    QuestionDifficulty,
-    PhoneAFriendResult,
-    FiftyFiftyResult,
-    AskTheAudienceResult,
-    GameResponse,
-    LifelineResult  // Add this import
-} from './commands/types';
 
 export class MenuManager {
     constructor(private telegramBot: TelegramBot_Agents | null, flowId: string) {
@@ -274,106 +258,10 @@ export class MenuManager {
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////
-    // In MenuManager.ts
+    // Menus working with patterns:
 
     // Main method to create pattern selection menu
-    createPatternSelectionMenu(
-        originalSuggestion?: any,
-        alternativePatterns?: string[]
-    ): Markup.Markup<InlineKeyboardMarkup> {
-        const buttons = [];
 
-        // Add main suggestion if available
-        if (originalSuggestion) {
-            buttons.push([
-                Markup.button.callback(`✨ Use ${originalSuggestion.pattern}`, `pattern_use:${originalSuggestion.pattern}`)
-            ]);
-
-            // Add alternative patterns if available
-            if (alternativePatterns?.length) {
-                buttons.push(
-                    alternativePatterns.slice(0, 2).map(p =>
-                        Markup.button.callback(`🔄 Try ${p}`, `pattern_use:${p}`)
-                    )
-                );
-            }
-        }
-
-        // Standard patterns
-        const standardPatterns = [
-            { name: 'summarize', emoji: '📝' },
-            { name: 'improve_writing', emoji: '✍️' },
-            { name: 'extract_wisdom', emoji: '💡' },
-            { name: 'write_essay', emoji: '📚' }
-        ];
-
-        buttons.push([
-            Markup.button.callback(`${standardPatterns[0].emoji} Summarize`, `pattern_use:${standardPatterns[0].name}`),
-            Markup.button.callback(`${standardPatterns[1].emoji} Improve`, `pattern_use:${standardPatterns[1].name}`)
-        ]);
-
-        buttons.push([
-            Markup.button.callback(`${standardPatterns[2].emoji} Extract Wisdom`, `pattern_use:${standardPatterns[2].name}`),
-            Markup.button.callback(`${standardPatterns[3].emoji} Write Essay`, `pattern_use:${standardPatterns[3].name}`)
-        ]);
-
-        // Navigation buttons
-        buttons.push([
-            Markup.button.callback('📋 More Patterns', 'pattern_more'),
-            Markup.button.callback('🔧 Advanced Options', 'pattern_advanced'),
-            Markup.button.callback('⏭️ Process Normally', 'pattern_skip')
-        ]);
-
-        return Markup.inlineKeyboard(buttons);
-    }
-
-
-    createPatternCategoriesMenu(categories: string[]): Markup.Markup<InlineKeyboardMarkup> {
-        // Create a visually appealing menu with emojis for each category
-        const categoryEmojis = {
-            'analysis': '🔍',
-            'summarization': '📝',
-            'extraction': '🔎',
-            'creation': '✨',
-            'explanation': '📚',
-            'general': '🧩'
-        };
-
-        const buttons = [];
-
-        // Group categories into rows of 2
-        for (let i = 0; i < categories.length; i += 2) {
-            const row = [];
-
-            // Add first button
-            const cat1 = categories[i];
-            const emoji1 = categoryEmojis[cat1 as keyof typeof categoryEmojis] || '📋';
-            row.push(Markup.button.callback(
-                `${emoji1} ${this.formatCategoryName(cat1)}`,
-                `pattern_category:${cat1}`
-            ));
-
-            // Add second button if it exists
-            if (i + 1 < categories.length) {
-                const cat2 = categories[i + 1];
-                const emoji2 = categoryEmojis[cat2 as keyof typeof categoryEmojis] || '📋';
-                row.push(Markup.button.callback(
-                    `${emoji2} ${this.formatCategoryName(cat2)}`,
-                    `pattern_category:${cat2}`
-                ));
-            }
-
-            buttons.push(row);
-        }
-
-        // Add navigation buttons
-        buttons.push([
-            Markup.button.callback('⬅️ Back', 'pattern_back_to_menu'),
-            Markup.button.callback('❌ Cancel', 'pattern_skip')
-        ]);
-
-        return Markup.inlineKeyboard(buttons);
-    }
 
     /**
      * Creates a menu for patterns in a specific category
@@ -525,34 +413,6 @@ export class MenuManager {
         return Markup.inlineKeyboard(buttons);
     }
 
-    /**
-     * Creates a menu of actions after pattern processing completion
-     */
-    createOutputActionsMenu(
-        patternName: string
-    ): Markup.Markup<InlineKeyboardMarkup> {
-        const buttons = [];
-
-        // Action buttons for the processed content
-        buttons.push([
-            Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
-            Markup.button.callback('📥 Download Result', `pattern_download:${patternName}`)
-        ]);
-
-        // Add button to return to original input
-        buttons.push([
-            Markup.button.callback('🔄 Use Original Input', 'pattern_use_full_input')
-        ]);
-
-        // Navigation buttons
-        buttons.push([
-            Markup.button.callback('📊 More Patterns', 'pattern_more'),
-            Markup.button.callback('🔧 Advanced Options', 'pattern_advanced'),
-            Markup.button.callback('✅ Done', 'pattern_skip')
-        ]);
-
-        return Markup.inlineKeyboard(buttons);
-    }
 
     public cleanup(): void {
         console.log(`[MenuManager] Starting cleanup...`);
@@ -569,33 +429,6 @@ export class MenuManager {
         console.log(`[MenuManager] Cleanup completed.`);
     }
 
-    // In MenuManager.ts
-
-    /**
-     * Creates a navigation menu for input chunks
-     */
-    createInputChunkNavigationMenu(
-        currentChunk: number,
-        totalChunks: number
-    ): Markup.Markup<InlineKeyboardMarkup> {
-        const buttons = [
-            [
-                Markup.button.callback('⬅️ Previous', `pattern_input_chunk:prev`),
-                Markup.button.callback(`${currentChunk + 1}/${totalChunks}`, 'pattern_noop'),
-                Markup.button.callback('Next ➡️', `pattern_input_chunk:next`)
-            ],
-            [
-                Markup.button.callback('✨ Process This Chunk', `pattern_select_chunk:${currentChunk}`),
-                Markup.button.callback('📊 Process All Chunks', `pattern_select_all_chunks`)
-            ],
-            [
-                Markup.button.callback('📋 Back to Patterns', 'pattern_back_to_menu'),
-                Markup.button.callback('✅ Done', 'pattern_skip')
-            ]
-        ];
-
-        return Markup.inlineKeyboard(buttons);
-    }
 
     /**
      * Creates a menu for pattern selection for a specific chunk
@@ -738,22 +571,254 @@ export class MenuManager {
         return Markup.inlineKeyboard(buttons);
     }
 
-   
-/**
- * Creates a menu for batch processing completion
- */
-createBatchCompletionMenu(
-    batchKey: string
-): Markup.Markup<InlineKeyboardMarkup> {
-    const buttons = [
-        [Markup.button.callback('🔍 View Results', `pattern_view_batch:${batchKey}:0`)],
-        [
-            Markup.button.callback('🔙 Back', 'pattern_select_all_chunks'),
-            Markup.button.callback('📋 Back to Patterns', 'pattern_back_to_menu'),
-            Markup.button.callback('✅ Done', 'pattern_skip')
-        ]
-    ];
+
+    /**
+     * Creates a menu for batch processing completion
+     */
+    createBatchCompletionMenu(
+        batchKey: string
+    ): Markup.Markup<InlineKeyboardMarkup> {
+        const buttons = [
+            [Markup.button.callback('🔍 View Results', `pattern_view_batch:${batchKey}:0`)],
+            [
+                Markup.button.callback('🔙 Back', 'pattern_select_all_chunks'),
+                Markup.button.callback('📋 Back to Patterns', 'pattern_back_to_menu'),
+                Markup.button.callback('✅ Done', 'pattern_skip')
+            ]
+        ];
+
+        return Markup.inlineKeyboard(buttons);
+    }
+
+    // In MenuManager.ts, add these helper methods
+
+    // Helper method to create consistent navigation footer
+    createNavigationFooter(
+        includeBack: boolean = true,
+        includeHome: boolean = true,
+        includeCancel: boolean = true
+    ): InlineKeyboardButton[][] {
+        const footer = [];
+        const navRow = [];
+
+        if (includeBack) {
+            navRow.push(Markup.button.callback('⬅️ Back', 'pattern_back_to_menu'));
+        }
+
+        if (includeHome) {
+            navRow.push(Markup.button.callback('🏠 Main Menu', 'pattern_categories'));
+        }
+
+        if (includeCancel) {
+            navRow.push(Markup.button.callback('❌ Cancel', 'pattern_skip'));
+        }
+
+        if (navRow.length > 0) {
+            footer.push(navRow);
+        }
+
+        return footer;
+    }
+
+    // Helper to display breadcrumbs for navigation context
+    createBreadcrumb(path: string[]): string {
+        return path.join(' > ');
+    }
+
+    // In MenuManager.ts, update the createPatternSelectionMenu method
+    createPatternSelectionMenu(
+        originalSuggestion?: any,
+        alternativePatterns?: string[]
+    ): Markup.Markup<InlineKeyboardMarkup> {
+        const buttons = [];
+
+        // Add main suggestion section if available
+        if (originalSuggestion) {
+            // Heading for recommended pattern (not a button)
+            buttons.push([
+                Markup.button.callback(`✨ Use ${originalSuggestion.pattern}`, `pattern_use:${originalSuggestion.pattern}`)
+            ]);
+
+            // Add alternative patterns if available
+            if (alternativePatterns?.length) {
+                const alternativeRows = [];
+                for (let i = 0; i < Math.min(alternativePatterns.length, 4); i += 2) {
+                    const row = [];
+                    row.push(Markup.button.callback(`🔄 ${alternativePatterns[i]}`, `pattern_use:${alternativePatterns[i]}`));
+
+                    if (i + 1 < alternativePatterns.length) {
+                        row.push(Markup.button.callback(`🔄 ${alternativePatterns[i + 1]}`, `pattern_use:${alternativePatterns[i + 1]}`));
+                    }
+
+                    alternativeRows.push(row);
+                }
+                buttons.push(...alternativeRows);
+            }
+
+            // Visual separator (empty button with no callback)
+            buttons.push([Markup.button.callback('━━━━━━━━━━━━━━━', 'pattern_noop')]);
+        }
+
+        // Common patterns section - organized by type
+        buttons.push([
+            Markup.button.callback(`📝 Summarize`, `pattern_use:summarize`),
+            Markup.button.callback(`🔍 Extract Insights`, `pattern_use:extract_wisdom`)
+        ]);
+
+        buttons.push([
+            Markup.button.callback(`✍️ Improve Writing`, `pattern_use:improve_writing`),
+            Markup.button.callback(`📚 Create Essay`, `pattern_use:write_essay`)
+        ]);
+
+        // Navigation and advanced options
+        const actionRow = [
+            Markup.button.callback('📋 More Patterns', 'pattern_more')
+        ];
+
+        if (originalSuggestion) {
+            actionRow.push(Markup.button.callback('🧩 Advanced', 'pattern_advanced'));
+        }
+
+        buttons.push(actionRow);
+
+        // Add standard navigation footer
+        buttons.push(...this.createNavigationFooter(false, false, true));
+
+        return Markup.inlineKeyboard(buttons);
+    }
+    // In MenuManager.ts, update the createPatternCategoriesMenu method
+    createPatternCategoriesMenu(categories: string[]): Markup.Markup<InlineKeyboardMarkup> {
+        const buttons = [];
+
+        // Add header
+        buttons.push([
+            Markup.button.callback('📋 Pattern Categories', 'pattern_noop')
+        ]);
+
+        // Create category mapping with friendly names and emojis
+        const categoryConfig = {
+            'analysis': { emoji: '🔍', name: 'Analysis' },
+            'summarization': { emoji: '📝', name: 'Summarization' },
+            'extraction': { emoji: '🔎', name: 'Extraction' },
+            'creation': { emoji: '✨', name: 'Creation' },
+            'explanation': { emoji: '📚', name: 'Explanation' },
+            'general': { emoji: '🧩', name: 'General' }
+        };
+
+        // Group categories into rows of 2
+        for (let i = 0; i < categories.length; i += 2) {
+            const row = [];
+
+            // Add first button
+            const cat1 = categories[i];
+            const config1 = categoryConfig[cat1 as keyof typeof categoryConfig] || { emoji: '📋', name: this.formatCategoryName(cat1) };
+            row.push(Markup.button.callback(
+                `${config1.emoji} ${config1.name}`,
+                `pattern_category:${cat1}`
+            ));
+
+            // Add second button if it exists
+            if (i + 1 < categories.length) {
+                const cat2 = categories[i + 1];
+                const config2 = categoryConfig[cat2 as keyof typeof categoryConfig] || { emoji: '📋', name: this.formatCategoryName(cat2) };
+                row.push(Markup.button.callback(
+                    `${config2.emoji} ${config2.name}`,
+                    `pattern_category:${cat2}`
+                ));
+            }
+
+            buttons.push(row);
+        }
+
+        // Add navigation footer
+        buttons.push(...this.createNavigationFooter(true, false, true));
+
+        return Markup.inlineKeyboard(buttons);
+    }
+
+    // In MenuManager.ts, update the createInputChunkNavigationMenu method
+    createInputChunkNavigationMenu(
+        currentChunk: number,
+        totalChunks: number
+    ): Markup.Markup<InlineKeyboardMarkup> {
+        const buttons = [];
+        
+        // Navigation controls
+        const navRow = [];
+        
+        // First/prev buttons
+        if (currentChunk > 0) {
+            navRow.push(Markup.button.callback('\u23ee\ufe0f First', `pattern_input_chunk:first`));
+            navRow.push(Markup.button.callback('\u25c0\ufe0f Prev', `pattern_input_chunk:prev`));
+        } else {
+            navRow.push(Markup.button.callback('\u23ee\ufe0f', 'pattern_noop'));
+            navRow.push(Markup.button.callback('\u25c0\ufe0f', 'pattern_noop'));
+        }
+        
+        // Progress indicator
+        const progressPercent = Math.round((currentChunk + 1) / totalChunks * 100);
+        navRow.push(Markup.button.callback(`${currentChunk + 1}/${totalChunks}`, 'pattern_noop'));
+        
+        // Next/last buttons
+        if (currentChunk < totalChunks - 1) {
+            navRow.push(Markup.button.callback('\u25b6\ufe0f Next', `pattern_input_chunk:next`));
+            navRow.push(Markup.button.callback('\u23ed\ufe0f Last', `pattern_input_chunk:last`));
+        } else {
+            navRow.push(Markup.button.callback('\u25b6\ufe0f', 'pattern_noop'));
+            navRow.push(Markup.button.callback('\u23ed\ufe0f', 'pattern_noop'));
+        }
+        
+        buttons.push(navRow);
+        
+        // Action buttons
+        buttons.push([
+            Markup.button.callback('\u2728 Process This Chunk', `pattern_select_chunk:${currentChunk}`)
+        ]);
+        
+        // Add batch processing option
+        buttons.push([
+            Markup.button.callback('\U0001f504 Process All Chunks', `pattern_select_all_chunks`)
+        ]);
+        
+        // Add navigation footer
+        buttons.push([
+            Markup.button.callback('\U0001f519 Back', 'pattern_back_to_menu'),
+            Markup.button.callback('\u2705 Done', 'pattern_skip')
+        ]);
     
-    return Markup.inlineKeyboard(buttons);
-}
+        return Markup.inlineKeyboard(buttons);
+    }
+    
+    // In MenuManager.ts, update the createOutputActionsMenu method
+    createOutputActionsMenu(
+        patternName: string
+    ): Markup.Markup<InlineKeyboardMarkup> {
+        const buttons = [];
+
+        // Header
+        buttons.push([
+            Markup.button.callback(`✅ Processed with ${patternName}`, 'pattern_noop')
+        ]);
+
+        // Primary actions
+        buttons.push([
+            Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
+            Markup.button.callback('💾 Save Result', `pattern_download:${patternName}`)
+        ]);
+
+        // Secondary actions
+        buttons.push([
+            Markup.button.callback('🔄 Use Original Input', 'pattern_use_full_input'),
+            Markup.button.callback('🧩 Advanced Options', 'pattern_advanced')
+        ]);
+
+        // Add navigation footer with "Done" instead of "Cancel"
+        buttons.push([
+            Markup.button.callback('📋 More Patterns', 'pattern_more'),
+            Markup.button.callback('✅ Done', 'pattern_skip')
+        ]);
+
+        return Markup.inlineKeyboard(buttons);
+    }
+
 }

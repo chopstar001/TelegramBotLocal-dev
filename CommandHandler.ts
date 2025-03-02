@@ -5,6 +5,7 @@ import { IExtendedMemory, Command, ExtendedIMessage, SourceCitation, EnhancedRes
 //import * as commands from './commands';
 import { BotCommand, Update, InlineKeyboardMarkup } from 'telegraf/typings/core/types/typegram';
 import { PromptManager } from './PromptManager';
+import { ToolManager } from './ToolManager';
 import { AgentManager } from './AgentManager';
 import { RAGAgent } from './agents/RAGAgent';
 import { TelegramBot_Agents } from './TelegramBot_Agents';
@@ -37,6 +38,8 @@ export class CommandHandler {
     private botInfo: BotInfo[];
     private menuManager: MenuManager | null;
     private flowId: string;
+    private toolManager: ToolManager;
+
 
     constructor(
         bot: Telegraf<Context>,
@@ -45,6 +48,8 @@ export class CommandHandler {
         promptManager: PromptManager | null,
         agentManager: AgentManager | null,
         menuManager: MenuManager | null,
+        toolManager: ToolManager | null,
+
         flowId: string,
         config?: {
             telegramBot: TelegramBot_Agents,
@@ -57,11 +62,24 @@ export class CommandHandler {
         this.promptManager = promptManager;
         this.agentManager = agentManager;
         this.menuManager = menuManager;
+        this.toolManager;
         this.telegramBot = config?.telegramBot || null;
         this.botIds = this.telegramBot?.getBotIds() || [];
         this.botCommandMenus = new Map();
         this.botInfo = this.telegramBot?.getAllBotInfo() || [];
         this.flowId = flowId;
+        
+
+        console.log(`[CommandHandler:${flowId}] Initialized with:`, {
+            hasBot: !!bot,
+            hasConversationManager: !!conversationManager,
+            hasMemory: !!memory,
+            hasPromptManager: !!promptManager,
+            hasAgentManager: !!agentManager,
+            hasMenuManager: !!menuManager,
+            hasToolManager: !!toolManager,
+            hasTelegramBot: !!config?.telegramBot
+        });
     }
 
 
@@ -87,7 +105,12 @@ export class CommandHandler {
     public setMenuManager(menuManager: MenuManager) {
         this.menuManager = menuManager;
     }
-
+    private getToolManager(): ToolManager | null {
+        if (this.telegramBot) {
+            return this.telegramBot.getToolManager();
+        }
+        return null;
+    }
     async registerCommands(): Promise<void> {
         if (!this.conversationManager) {
             console.error('ConversationManager is not initialized. Cannot register commands.');
@@ -192,7 +215,46 @@ export class CommandHandler {
                 const adapter = new ContextAdapter(ctx, this.promptManager);
                 return this.handleCommandExecution(adapter);
             });
+            this.bot.action(/^pattern_(.+)$/, async (ctx) => {
+                const fullAction = ctx.match[1];
+                const adapter = new ContextAdapter(ctx, this.promptManager);
 
+                console.log(`[CommandHandler] Received pattern action: ${fullAction}`);
+
+                // Split action and parameter
+                let action: string;
+                let parameter: string | undefined;
+
+                if (fullAction.includes(':')) {
+                    const parts = fullAction.split(':');
+                    action = parts[0];
+                    parameter = parts.slice(1).join(':'); // Rejoin in case parameter itself contains ':'
+                } else {
+                    action = fullAction;
+                }
+
+                // Handle the action
+                await this.handlePatternAction(adapter, action, parameter);
+            });
+            // Input chunk navigation - separate handler for clarity
+            this.bot.action(/^pattern_input_chunk:(.+)$/, async (ctx) => {
+                const direction = ctx.match[1]; // prev, next, first, last
+                const adapter = new ContextAdapter(ctx, this.promptManager);
+
+                console.log(`[CommandHandler] Input chunk navigation: ${direction}`);
+
+                await this.navigateInputChunks(
+                    adapter,
+                    adapter.getMessageContext().userId.toString(),
+                    direction
+                );
+            });
+            this.bot.action(/^yt_get:([^:]+):(.+)$/, async (ctx) => {
+                const videoId = ctx.match[1];
+                const action = ctx.match[2];
+                const adapter = new ContextAdapter(ctx, this.promptManager);
+                await this.handleYouTubeAction(adapter, videoId, action);
+            });
             await this.bot.telegram.setMyCommands(botCommands);
             console.log('Bot commands set successfully');
 
@@ -1095,15 +1157,30 @@ export class CommandHandler {
         }
 
         // Determine the input to use for processing
-        // ADD THE CODE HERE - Determine the input to use for processing
         let input: string;
-        if (patternData.currentPatternState.useProcessedOutput) {
-            // Use previously processed output if specified
+        let inputSource = 'original input';
+
+        // Check for selected chunk first
+        if (patternData.currentPatternState.selectedInputChunk !== undefined &&
+            patternData.inputChunks?.chunks) {
+            const chunkIndex = patternData.currentPatternState.selectedInputChunk;
+            if (chunkIndex >= 0 && chunkIndex < patternData.inputChunks.chunks.length) {
+                input = patternData.inputChunks.chunks[chunkIndex];
+                inputSource = `input chunk ${chunkIndex + 1}`;
+                console.log(`[${methodName}] Using input chunk ${chunkIndex + 1} as input`);
+            } else {
+                input = patternData.originalInput;
+                console.log(`[${methodName}] Selected chunk out of range, using original input`);
+            }
+        }
+        // Then check for processed output
+        else if (patternData.currentPatternState.useProcessedOutput) {
             const sourceName = patternData.currentPatternState.useProcessedOutput;
             const sourceOutput = patternData.processedOutputs[sourceName]?.output;
 
             if (sourceOutput) {
                 input = sourceOutput;
+                inputSource = `processed output "${sourceName}"`;
                 console.log(`[${methodName}] Using processed output from ${sourceName} as input`);
             } else {
                 input = patternData.originalInput;
@@ -1117,63 +1194,157 @@ export class CommandHandler {
 
         await adapter.safeAnswerCallbackQuery(`Processing with ${patternName} pattern...`);
 
-        // Show processing status in menu
+        // Show processing status in menu with more detail
         const menuMessageId = adapter.context.messageId;
-        if (menuMessageId) {
-            try {
+        try {
+            if (menuMessageId) {
                 await adapter.editMessageText(
-                    `🔄 Processing with ${patternName} pattern...\n\nThis may take a moment.`,
+                    `🔄 <b>Processing with ${patternName} pattern...</b>\n\n` +
+                    `Using ${inputSource} (${Math.round(input.length / 100) / 10}KB)\n\n` +
+                    `This may take a moment.`,
                     { parse_mode: 'HTML' }
                 );
-            } catch (error) {
-                console.warn(`[${methodName}] Error updating menu message:`, error);
             }
+        } catch (error) {
+            console.warn(`[${methodName}] Error updating menu message:`, error);
+            // Continue processing - this is just a UI issue
         }
 
+        // Variables for tracking retries
+        let retryCount = 0;
+        const maxRetries = 2;
+        let result: string | null = null;
+        let processingError: Error | null = null;
+        const startTime = Date.now();
+
         try {
-            // Process the entire input in one go
-            // For extremely large inputs (over model context limit), we'd need to handle differently
-            let result: string;
-
-            if (input.length > 100000) {  // Arbitrary threshold for extremely large inputs
-                await adapter.editMessageText(
-                    `⚠️ This content is extremely large (${Math.round(input.length / 1000)}K characters).\n\nProcessing in chunks...`,
-                    { parse_mode: 'HTML' }
-                );
-
-                // For extremely large content, we still need to process in chunks
-                const inputChunks = this.splitInput(input);
-                console.log(`[${methodName}] Processing large input in ${inputChunks.length} chunks`);
-
-                // Process each chunk and combine results
-                const chunkResults: string[] = [];
-                for (let i = 0; i < inputChunks.length; i++) {
-                    // Update progress
-                    if (menuMessageId) {
+            // Processing with retry logic
+            while (retryCount <= maxRetries && !result) {
+                try {
+                    if (retryCount > 0) {
+                        // Show retry message
                         try {
-                            await adapter.editMessageText(
-                                `🔄 Processing with ${patternName} pattern...\n\nProcessing chunk ${i + 1}/${inputChunks.length}`,
+                            await adapter.reply(
+                                `⚠️ Connection issue detected. Retry attempt ${retryCount}/${maxRetries}...`,
                                 { parse_mode: 'HTML' }
                             );
-                        } catch (error) {
-                            console.warn(`[${methodName}] Error updating chunk progress:`, error);
+                        } catch (msgError) {
+                            console.warn(`[${methodName}] Error sending retry message:`, msgError);
                         }
+
+                        // Use exponential backoff for retries
+                        const backoffTime = 2000 * Math.pow(2, retryCount - 1);
+                        await new Promise(resolve => setTimeout(resolve, backoffTime));
                     }
 
-                    // Process this chunk
-                    const chunkResult = await patternAgent.processWithPattern(
-                        patternName,
-                        inputChunks[i],
-                        adapter
-                    );
-                    chunkResults.push(chunkResult);
-                }
+                    // Process based on input size
+                    if (input.length > 100000) {  // Extremely large inputs         
+                        try {
+                            await adapter.reply(
+                                `⚠️ This content is extremely large (${Math.round(input.length / 1000)}KB).\n\n` +
+                                `Processing in chunks... This may take several minutes.`,
+                                { parse_mode: 'HTML' }
+                            );
+                        } catch (msgError) {
+                            console.warn(`[${methodName}] Error sending large input message:`, msgError);
+                        }
 
-                // Combine results
-                result = this.combineChunkResults(patternName, chunkResults);
-            } else {
-                // Normal processing for reasonable sized inputs
-                result = await patternAgent.processWithPattern(patternName, input, adapter);
+                        // Process in chunks
+                        const inputChunks = this.splitInput(input);
+                        console.log(`[${methodName}] Processing large input in ${inputChunks.length} chunks`);
+
+                        // Process each chunk with individual retry logic
+                        const chunkResults: string[] = [];
+                        for (let i = 0; i < inputChunks.length; i++) {
+                            // Update progress occasionally (not every chunk to avoid rate limits)
+                            if (i % 3 === 0) {
+                                try {
+                                    const percent = Math.round((i / inputChunks.length) * 100);
+                                    await adapter.reply(
+                                        `📊 Progress update: Processing chunk ${i + 1}/${inputChunks.length} (${percent}%)`,
+                                        { parse_mode: 'HTML' }
+                                    );
+                                } catch (progError) {
+                                    console.warn(`[${methodName}] Error sending progress update:`, progError);
+                                }
+                            }
+
+                            // Process this chunk with its own retry logic
+                            let chunkRetries = 0;
+                            let chunkResult: string | null = null;
+
+                            while (chunkRetries <= 1 && !chunkResult) { // Max 1 retry per chunk
+                                try {
+                                    chunkResult = await patternAgent.processWithPattern(
+                                        patternName,
+                                        inputChunks[i],
+                                        adapter
+                                    );
+                                } catch (chunkError) {
+                                    console.warn(`[${methodName}] Error processing chunk ${i + 1}:`, chunkError);
+
+                                    if (chunkRetries < 1) {
+                                        // Wait before retry
+                                        await new Promise(resolve => setTimeout(resolve, 3000));
+                                        chunkRetries++;
+                                    } else {
+                                        // If we've retried and still failed, use a placeholder
+                                        chunkResult = `[Error processing this section. The content was too complex or connection was interrupted.]`;
+                                    }
+                                }
+                            }
+
+                            chunkResults.push(chunkResult || '[Processing error]');
+                        }
+
+                        // Combine results
+                        result = this.combineChunkResults(patternName, chunkResults);
+                    } else {
+                        // Normal processing for reasonable sized inputs
+                        result = await patternAgent.processWithPattern(patternName, input, adapter);
+                    }
+
+                    // If we get here without an error, processing succeeded
+                    break;
+
+                } catch (error) {
+                    processingError = error instanceof Error ? error : new Error(String(error));
+                    console.error(`[${methodName}] Processing attempt ${retryCount + 1} failed:`, error);
+
+                    // Check if this is a network error that we should retry
+                    const errorString = String(error);
+                    const shouldRetry = errorString.includes('ECONNRESET') ||
+                        errorString.includes('aborted') ||
+                        errorString.includes('timeout') ||
+                        errorString.includes('rate limit');
+
+                    if (shouldRetry && retryCount < maxRetries) {
+                        retryCount++;
+                    } else {
+                        // Either not a retriable error or we've hit max retries
+                        throw error;
+                    }
+                }
+            }
+
+            // At this point, we should have a result or have thrown an error
+            if (!result) {
+                throw new Error("Failed to process pattern after retries");
+            }
+
+            // Show completion message with stats
+            const processingTime = Math.round((Date.now() - startTime) / 100) / 10;
+            try {
+                await adapter.reply(
+                    `✅ <b>Processing complete!</b>\n\n` +
+                    `<b>Pattern:</b> ${patternName}\n` +
+                    `<b>Input size:</b> ${Math.round(input.length / 100) / 10}KB\n` +
+                    `<b>Output size:</b> ${Math.round(result.length / 100) / 10}KB\n` +
+                    `<b>Time:</b> ${processingTime}s`,
+                    { parse_mode: 'HTML' }
+                );
+            } catch (msgError) {
+                console.warn(`[${methodName}] Error sending completion message:`, msgError);
             }
 
             // Store the result
@@ -1186,19 +1357,37 @@ export class CommandHandler {
                 timestamp: Date.now()
             };
 
-            // Show output actions menu using helper method
-            await this.showOutputActionsMenu(adapter, result, adapter.context.messageId ? adapter.context.messageId.toString() : '', 'HTML');
+            // Update pattern state tracking
+            if (!patternData.currentPatternState) {
+                patternData.currentPatternState = {};
+            }
+            patternData.currentPatternState.lastProcessedPattern = patternName;
 
             // For display purposes, check if we need to split the output for Telegram
             // For single messages
             if (result.length <= 4000) {
                 // Send as single message with HTML parsing
-                // const htmlResult = this.convertMarkdownToHtml(result); // Convert if result is in Markdown format
-                const sentMessage = await adapter.reply(result, { parse_mode: 'HTML' });
+                let sentMessage;
+                try {
+                    sentMessage = await adapter.reply(result, { parse_mode: 'HTML' });
+                } catch (msgError) {
+                    console.warn(`[${methodName}] Error sending result message:`, msgError);
+
+                    // Try sending as plain text if HTML parsing fails
+                    try {
+                        sentMessage = await adapter.reply(result);
+                    } catch (plainError) {
+                        console.error(`[${methodName}] Error sending plain result:`, plainError);
+                        throw new Error("Failed to send result message");
+                    }
+                }
 
                 // Store the message ID if available
                 if (sentMessage && 'message_id' in sentMessage) {
                     patternData.processedOutputs[patternName].messageIds = [sentMessage.message_id];
+
+                    // Wait a moment before trying to edit to avoid rate limiting
+                    await new Promise(resolve => setTimeout(resolve, 1500));
 
                     // Add menu to this single message by editing it
                     const buttons = [];
@@ -1206,7 +1395,7 @@ export class CommandHandler {
                     // Action buttons for the processed content
                     buttons.push([
                         Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
-                        Markup.button.callback('📥 Download Result', `pattern_download:${patternName}`)
+                        Markup.button.callback('💾 Save Result', `pattern_download:${patternName}`)
                     ]);
 
                     // Add this button to return to original input
@@ -1216,8 +1405,7 @@ export class CommandHandler {
 
                     // Navigation buttons
                     buttons.push([
-                        Markup.button.callback('📊 More Patterns', 'pattern_more'),
-                        Markup.button.callback('🔧 Advanced Options', 'pattern_advanced'),
+                        Markup.button.callback('📋 More Patterns', 'pattern_more'),
                         Markup.button.callback('✅ Done', 'pattern_skip')
                     ]);
 
@@ -1235,13 +1423,17 @@ export class CommandHandler {
                         console.warn(`[${methodName}] Error adding menu to result message:`, error);
 
                         // Fallback: send a separate menu message
-                        await adapter.reply(
-                            `📝 <b>Result processed with ${patternName}</b>`,
-                            {
-                                parse_mode: 'HTML',
-                                reply_markup: keyboard.reply_markup
-                            }
-                        );
+                        try {
+                            await adapter.reply(
+                                `📝 <b>Result processed with ${patternName}</b>`,
+                                {
+                                    parse_mode: 'HTML',
+                                    reply_markup: keyboard.reply_markup
+                                }
+                            );
+                        } catch (menuError) {
+                            console.warn(`[${methodName}] Error sending menu message:`, menuError);
+                        }
                     }
                 }
             } else {
@@ -1251,16 +1443,34 @@ export class CommandHandler {
 
                 const messageIds: number[] = [];
 
-                // Send each output chunk
+                // Send each output chunk with appropriate delay to avoid rate limiting
                 for (let i = 0; i < outputChunks.length; i++) {
                     const isLastChunk = i === outputChunks.length - 1;
                     const chunkText = outputChunks[i] + (isLastChunk ? '' : '\n[continued in next message...]');
 
+                    // Wait between messages
+                    if (i > 0) {
+                        await new Promise(resolve => setTimeout(resolve, 1500));
+                    }
+
                     // For the last chunk, include buttons
-                    const sentMessage = await adapter.reply(
-                        chunkText,
-                        { parse_mode: 'Markdown' }
-                    );
+                    let sentMessage;
+                    try {
+                        sentMessage = await adapter.reply(
+                            chunkText,
+                            { parse_mode: 'Markdown' }
+                        );
+                    } catch (chunkError) {
+                        console.warn(`[${methodName}] Error sending chunk ${i + 1}:`, chunkError);
+
+                        // Try without markdown
+                        try {
+                            sentMessage = await adapter.reply(chunkText);
+                        } catch (plainError) {
+                            console.error(`[${methodName}] Error sending plain chunk:`, plainError);
+                            continue; // Skip this chunk and continue
+                        }
+                    }
 
                     // Store message ID if available
                     if (sentMessage && 'message_id' in sentMessage) {
@@ -1268,23 +1478,22 @@ export class CommandHandler {
 
                         // If this is the last chunk, add menu buttons
                         if (isLastChunk) {
+                            // Wait before editing to avoid rate limiting
+                            await new Promise(resolve => setTimeout(resolve, 1500));
+
                             const buttons = [];
 
                             // Add navigation controls for multi-chunk results
                             buttons.push([
-                                Markup.button.callback('⬅️ Previous Chunk', `pattern_chunk:${patternName}:prev`),
+                                Markup.button.callback('⬅️ Previous', `pattern_chunk:${patternName}:prev`),
                                 Markup.button.callback(`${i + 1}/${outputChunks.length}`, 'pattern_noop'),
-                                Markup.button.callback('Next Chunk ➡️', `pattern_chunk:${patternName}:next`)
+                                Markup.button.callback('Next ➡️', `pattern_chunk:${patternName}:next`)
                             ]);
 
                             // Action buttons
                             buttons.push([
                                 Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
-                                Markup.button.callback('📥 Download', `pattern_download:${patternName}`),
-                            ]);
-
-                            buttons.push([
-                                Markup.button.callback('🔍 Browse Input Chunks', 'pattern_browse_input'),
+                                Markup.button.callback('💾 Save Result', `pattern_download:${patternName}`),
                             ]);
 
                             const keyboard = Markup.inlineKeyboard(buttons);
@@ -1300,13 +1509,26 @@ export class CommandHandler {
                                 );
                             } catch (error) {
                                 console.warn(`[${methodName}] Error adding menu to final chunk:`, error);
+
+                                // Fallback: send a separate menu message
+                                try {
+                                    await adapter.reply(
+                                        `📝 <b>Navigation for ${patternName} results</b>`,
+                                        {
+                                            parse_mode: 'HTML',
+                                            reply_markup: keyboard.reply_markup
+                                        }
+                                    );
+                                } catch (menuError) {
+                                    console.warn(`[${methodName}] Error sending nav menu:`, menuError);
+                                }
                             }
                         }
                     }
 
-                    // Short delay to maintain order
+                    // Add longer delay between chunks to respect rate limits
                     if (!isLastChunk) {
-                        await new Promise(resolve => setTimeout(resolve, 300));
+                        await new Promise(resolve => setTimeout(resolve, 2000));
                     }
                 }
 
@@ -1314,74 +1536,103 @@ export class CommandHandler {
                 if (messageIds.length > 0) {
                     patternData.processedOutputs[patternName].messageIds = messageIds;
 
-                    // Create navigation buttons
-                    const buttons = [];
+                    // Additional navigation menu if we have multiple chunks
+                    if (messageIds.length > 1) {
+                        // Wait before sending additional messages
+                        await new Promise(resolve => setTimeout(resolve, 1500));
 
-                    // Add navigation controls for multi-chunk results
-                    buttons.push([
-                        Markup.button.callback('⬅️ First Chunk', `pattern_chunk:${patternName}:first`),
-                        Markup.button.callback(`1/${outputChunks.length}`, 'pattern_noop'),
-                        Markup.button.callback('Last Chunk ➡️', `pattern_chunk:${patternName}:last`)
-                    ]);
+                        // Create navigation buttons
+                        const buttons = [];
 
-                    // Action buttons
-                    buttons.push([
-                        Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
-                        Markup.button.callback('📥 Download', `pattern_download:${patternName}`)
-                    ]);
+                        // Add navigation controls for multi-chunk results
+                        buttons.push([
+                            Markup.button.callback('⏮️ First', `pattern_chunk:${patternName}:first`),
+                            Markup.button.callback(`1/${outputChunks.length}`, 'pattern_noop'),
+                            Markup.button.callback('⏭️ Last', `pattern_chunk:${patternName}:last`)
+                        ]);
 
-                    const keyboard = Markup.inlineKeyboard(buttons);
+                        // Action buttons
+                        buttons.push([
+                            Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
+                            Markup.button.callback('💾 Save Result', `pattern_download:${patternName}`)
+                        ]);
 
-                    // Send a separate menu message
-                    await adapter.reply(
-                        `📝 <b>Result processed with ${patternName}</b> (${outputChunks.length} parts)`,
-                        {
-                            parse_mode: 'HTML',
-                            reply_markup: keyboard.reply_markup
+                        const keyboard = Markup.inlineKeyboard(buttons);
+
+                        // Send a separate menu message
+                        try {
+                            await adapter.reply(
+                                `📝 <b>Result processed with ${patternName}</b> (${outputChunks.length} parts)`,
+                                {
+                                    parse_mode: 'HTML',
+                                    reply_markup: keyboard.reply_markup
+                                }
+                            );
+                        } catch (menuError) {
+                            console.warn(`[${methodName}] Error sending nav overview:`, menuError);
                         }
-                    );
+                    }
                 }
             }
 
             // Update pattern data in cache
             this.conversationManager!.cache.set(patternDataKey, patternData, 7200);
             this.storePatternOutput(userId, patternName, result);
-            // Remove the separate calls to addInteractiveControls and showOutputActionsMenu
-            // since we're now adding menus directly to the result messages            
-            /*
-                        // Add interactive controls for multi-chunk results
-                        if (patternData.processedOutputs[patternName]?.chunks &&
-                            patternData.processedOutputs[patternName].chunks!.length > 1 &&
-                            patternData.processedOutputs[patternName]?.messageIds &&
-                            patternData.processedOutputs[patternName].messageIds!.length > 0) {
-                            await this.addInteractiveControls(adapter, userId, patternName);
-                        } else {
-                            // For single messages, just show the output actions menu
-                            await this.showOutputActionsMenu(adapter, userId, patternName, menuMessageId);
-                        }
-            */
         } catch (error) {
             console.error(`[${methodName}] Error:`, error);
 
-            // Show error in menu
-            if (menuMessageId) {
+            // Enhanced error handling with recovery options
+            // Attempt to show error message
+            try {
+                const errorMessage = error instanceof Error
+                    ? error.message
+                    : 'Unknown error occurred';
+
+                // Categorize errors for better user feedback
+                let userMessage: string;
+                let errorType: string;
+
+                if (errorMessage.includes('ECONNRESET') || errorMessage.includes('aborted')) {
+                    userMessage = 'Connection to AI service was interrupted. Please try again.';
+                    errorType = 'connection';
+                } else if (errorMessage.includes('timeout') || errorMessage.includes('timed out')) {
+                    userMessage = 'Processing took too long and timed out. Try smaller content or a different pattern.';
+                    errorType = 'timeout';
+                } else if (errorMessage.includes('too many tokens') || errorMessage.includes('context length')) {
+                    userMessage = 'Content is too large for this pattern. Try using smaller chunks.';
+                    errorType = 'content_size';
+                } else if (errorMessage.includes('rate limit') || errorMessage.includes('Too Many Requests')) {
+                    userMessage = 'Rate limit reached. Please wait a moment before trying again.';
+                    errorType = 'rate_limit';
+                } else {
+                    userMessage = 'Error processing with this pattern. Please try another.';
+                    errorType = 'general';
+                }
+
+                // Send as new message to avoid edit rate limiting
+                await adapter.reply(
+                    `❌ <b>Error processing with ${patternName}</b>\n\n` +
+                    `${userMessage}\n\n` +
+                    `<i>Type: ${errorType}</i>`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Try Another Pattern', 'pattern_back_to_menu')],
+                            [Markup.button.callback('🔍 Browse Input Chunks', 'pattern_browse_input')],
+                            [Markup.button.callback('❌ Cancel', 'pattern_skip')]
+                        ]).reply_markup
+                    }
+                );
+            } catch (msgError) {
+                console.error(`[${methodName}] Error sending error message:`, msgError);
+
+                // Last resort - try a simple message
                 try {
-                    await adapter.editMessageText(
-                        `❌ <b>Error processing with ${patternName} pattern</b>\n\nPlease try another pattern:`,
-                        {
-                            parse_mode: 'HTML',
-                            reply_markup: Markup.inlineKeyboard([
-                                [Markup.button.callback('Try Another Pattern', 'pattern_back_to_menu')],
-                                [Markup.button.callback('Cancel', 'pattern_skip')]
-                            ]).reply_markup
-                        }
-                    );
-                } catch (editError) {
-                    console.warn(`[${methodName}] Error updating menu:`, editError);
+                    await adapter.reply(`Error processing request. Please try again later.`);
+                } catch (e) {
+                    console.error(`[${methodName}] Failed to send error message:`, e);
                 }
             }
-
-            await adapter.reply(`Sorry, there was an error processing your request with the ${patternName} pattern: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
 
@@ -2068,24 +2319,24 @@ export class CommandHandler {
         patternName: string
     ): Promise<void> {
         const methodName = 'processAllChunks';
-        
+
         const patternData = this.conversationManager!.cache.get<PatternData>(`pattern_data:${userId}`);
         if (!patternData) {
             await adapter.answerCallbackQuery('Pattern data not available');
             return;
         }
-        
+
         // Ensure input chunks exist
         if (!patternData.inputChunks?.chunks || patternData.inputChunks.chunks.length === 0) {
             await adapter.answerCallbackQuery('No input chunks available for processing');
             return;
         }
-        
+
         const chunks = patternData.inputChunks.chunks;
         const chunkCount = chunks.length;
-        
+
         await adapter.safeAnswerCallbackQuery(`Processing ${chunkCount} chunks with ${patternName}...`);
-        
+
         // Show processing message
         const menuMessageId = adapter.context.messageId;
         if (menuMessageId) {
@@ -2098,32 +2349,32 @@ export class CommandHandler {
                 console.warn(`[${methodName}] Error updating message:`, error);
             }
         }
-        
+
         const patternAgent = this.agentManager!.getAgent('pattern') as PatternPromptAgent;
         if (!patternAgent) {
             throw new Error('Pattern agent not available');
         }
-        
+
         // Process each chunk
         const results: Array<{
             chunk: number;
             result?: string;
             error?: string;
         }> = [];
-        
+
         for (let i = 0; i < chunkCount; i++) {
             // Update progress message
             if (menuMessageId) {
                 try {
                     await adapter.editMessageText(
-                        `🔄 Processing chunk ${i+1}/${chunkCount} with ${patternName}...\n\nThis may take a while.`,
+                        `🔄 Processing chunk ${i + 1}/${chunkCount} with ${patternName}...\n\nThis may take a while.`,
                         { parse_mode: 'HTML' }
                     );
                 } catch (error) {
                     console.warn(`[${methodName}] Error updating progress:`, error);
                 }
             }
-            
+
             // Process the current chunk
             try {
                 const result = await patternAgent.processWithPattern(patternName, chunks[i], adapter);
@@ -2132,14 +2383,14 @@ export class CommandHandler {
                 console.error(`[${methodName}] Error processing chunk ${i}:`, error);
                 results.push({ chunk: i, error: error instanceof Error ? error.message : String(error) });
             }
-            
+
             // Small delay between chunks to avoid rate limiting
             await new Promise(resolve => setTimeout(resolve, 500));
         }
-        
+
         // Store combined results
         const batchKey = `${patternName}_batch_${Date.now()}`;
-        
+
         patternData.processedOutputs[batchKey] = {
             output: `Batch processing results for ${patternName} on ${chunkCount} chunks`,
             timestamp: Date.now(),
@@ -2147,12 +2398,12 @@ export class CommandHandler {
             chunks: results.map(r => r.result || `Error: ${r.error}`),
             isBatch: true
         };
-        
+
         this.conversationManager!.cache.set(`pattern_data:${userId}`, patternData, 3600);
-        
+
         // Use MenuManager to create the batch completion menu
         const keyboard = this.menuManager!.createBatchCompletionMenu(batchKey).reply_markup;
-        
+
         // Show completion message and menu
         try {
             await adapter.editMessageText(
@@ -2165,7 +2416,7 @@ export class CommandHandler {
             );
         } catch (error) {
             console.warn(`[${methodName}] Error showing completion message:`, error);
-            
+
             // Fallback: send a new message
             await adapter.reply(
                 `✅ <b>Batch processing complete!</b>\n\n` +
@@ -2176,7 +2427,7 @@ export class CommandHandler {
                 }
             );
         }
-        
+
         // Send a summary of the batch processing
         const summaryChunks = [];
         for (let i = 0; i < results.length; i += 5) {
@@ -2189,10 +2440,10 @@ export class CommandHandler {
                     return `Chunk ${r.chunk + 1}: Error: ${r.error}`;
                 }
             }).join('\n\n');
-            
+
             summaryChunks.push(chunkSummary);
         }
-        
+
         // Send the summary chunks
         for (const summary of summaryChunks) {
             await adapter.reply(
@@ -2202,7 +2453,7 @@ export class CommandHandler {
         }
     }
 
-   
+
     // In CommandHandler.ts
 
     private async navigateInputChunks(
@@ -2211,64 +2462,158 @@ export class CommandHandler {
         direction: string
     ): Promise<void> {
         const methodName = 'navigateInputChunks';
-        const patternData = this.conversationManager!.cache.get<PatternData>(`pattern_data:${userId}`);
+        console.log(`[${methodName}] Starting navigation with direction: "${direction}" for user: ${userId}`);
 
+        // Get the pattern data with proper null checks
+        const patternDataKey = `pattern_data:${userId}`;
+        let patternData = this.conversationManager?.cache.get<PatternData>(`pattern_data:${userId}`);
+
+        // If pattern data is not found, try to get from context data
         if (!patternData) {
-            await adapter.answerCallbackQuery('Input data not available');
-            return;
+            console.log(`[${methodName}] Pattern data not found, checking context data`);
+            const contextDataKey = `pattern_context:${userId}`;
+            const contextData = this.conversationManager?.cache.get<PatternContextData>(contextDataKey);
+
+            if (contextData?.input) {
+                console.log(`[${methodName}] Creating pattern data from context with input length: ${contextData.input.length}`);
+                patternData = {
+                    originalInput: contextData.input,
+                    processedOutputs: {},
+                    currentPatternState: {} // Initialize with empty object
+                };
+
+                // Ensure conversationManager is available
+                if (this.conversationManager) {
+                    this.conversationManager.cache.set(patternDataKey, patternData, 7200);
+                } else {
+                    console.error(`[${methodName}] ConversationManager is null or undefined`);
+                    await adapter.answerCallbackQuery('System error: ConversationManager unavailable');
+                    return;
+                }
+            } else {
+                console.warn(`[${methodName}] No context data found for ${userId}`);
+                await adapter.answerCallbackQuery('Input data not available');
+                return;
+            }
         }
 
-        // Ensure input chunks exist
+        console.log(`[${methodName}] Pattern data:`, {
+            hasOriginalInput: !!patternData.originalInput,
+            inputLength: patternData.originalInput?.length || 0,
+            hasInputChunks: !!patternData.inputChunks,
+            chunkCount: patternData.inputChunks?.chunks?.length || 0
+        });
+
+        // Create input chunks if they don't exist yet
         if (!patternData.inputChunks || !patternData.inputChunks.chunks || patternData.inputChunks.chunks.length === 0) {
-            // If no chunks yet, create them
             if (patternData.originalInput) {
+                console.log(`[${methodName}] Creating input chunks from original input of ${patternData.originalInput.length} bytes`);
+                const newChunks = this.splitInput(patternData.originalInput);
+                console.log(`[${methodName}] Created ${newChunks.length} chunks`);
+
                 patternData.inputChunks = {
-                    chunks: this.splitInput(patternData.originalInput),
+                    chunks: newChunks,
                     currentChunk: 0,
                     lastAccessed: Date.now()
                 };
+
+                // Initialize currentPatternState if needed - without uiState property
+                if (!patternData.currentPatternState) {
+                    patternData.currentPatternState = {};
+                }
+
+                // Ensure conversationManager is available
+                if (this.conversationManager) {
+                    this.conversationManager.cache.set(patternDataKey, patternData, 7200);
+                } else {
+                    console.error(`[${methodName}] ConversationManager is null or undefined`);
+                    await adapter.answerCallbackQuery('System error: ConversationManager unavailable');
+                    return;
+                }
             } else {
+                console.warn(`[${methodName}] No original input available to create chunks`);
                 await adapter.answerCallbackQuery('No input content available');
                 return;
             }
         }
 
-        // Get current chunk index
+        // Now that we're sure chunks exist, calculate new chunk index
         let currentIndex = patternData.inputChunks.currentChunk || 0;
-
-        // Calculate new chunk index
         let newIndex = currentIndex;
-        if (direction === 'next' && newIndex < patternData.inputChunks.chunks.length - 1) {
-            newIndex++;
-        } else if (direction === 'prev' && newIndex > 0) {
-            newIndex--;
+
+        console.log(`[${methodName}] Current index: ${currentIndex}, total chunks: ${patternData.inputChunks.chunks.length}, direction: ${direction}`);
+
+        // Calculate new index based on direction
+        if (direction === 'next' && currentIndex < patternData.inputChunks.chunks.length - 1) {
+            newIndex = currentIndex + 1;
+            console.log(`[${methodName}] Moving to next chunk: ${newIndex}`);
+        } else if (direction === 'prev' && currentIndex > 0) {
+            newIndex = currentIndex - 1;
+            console.log(`[${methodName}] Moving to previous chunk: ${newIndex}`);
         } else if (direction === 'first') {
             newIndex = 0;
+            console.log(`[${methodName}] Moving to first chunk`);
         } else if (direction === 'last') {
             newIndex = patternData.inputChunks.chunks.length - 1;
-        }
-
-        if (newIndex === currentIndex) {
-            await adapter.answerCallbackQuery('No more input chunks in that direction');
+            console.log(`[${methodName}] Moving to last chunk: ${newIndex}`);
+        } else {
+            console.log(`[${methodName}] Cannot navigate ${direction} from index ${currentIndex} of ${patternData.inputChunks.chunks.length} chunks`);
+            await adapter.answerCallbackQuery(`No more input chunks in that direction`);
             return;
         }
 
-        // Update current chunk index
+        if (newIndex === currentIndex) {
+            console.log(`[${methodName}] Index didn't change, cannot navigate further`);
+            await adapter.answerCallbackQuery(`Already at ${direction === 'next' || direction === 'last' ? 'last' : 'first'} chunk`);
+            return;
+        }
+
+        // Update pattern data
         patternData.inputChunks.currentChunk = newIndex;
         patternData.inputChunks.lastAccessed = Date.now();
         patternData.currentPatternState.selectedInputChunk = newIndex;
-        this.conversationManager!.cache.set(`pattern_data:${userId}`, patternData, 7200);
 
-        // Use MenuManager to create input chunk navigation menu
-        const keyboard = this.menuManager!.createInputChunkNavigationMenu(
+        // Save updated pattern data
+        console.log(`[${methodName}] Saving updated pattern data with new index: ${newIndex}`);
+
+        // Ensure conversationManager is available
+        if (this.conversationManager) {
+            this.conversationManager.cache.set(patternDataKey, patternData, 7200);
+        } else {
+            console.error(`[${methodName}] ConversationManager is null or undefined when trying to save`);
+            await adapter.answerCallbackQuery('System error: ConversationManager unavailable');
+            return;
+        }
+
+        // Create the navigation keyboard - ensure menuManager is not null
+        if (!this.menuManager) {
+            console.error(`[${methodName}] MenuManager is null or undefined`);
+            await adapter.answerCallbackQuery('System error: MenuManager unavailable');
+            return;
+        }
+
+        const keyboard = this.menuManager.createInputChunkNavigationMenu(
             newIndex,
             patternData.inputChunks.chunks.length
         ).reply_markup;
 
-        // Display the selected input chunk
+        // Display the selected chunk
         try {
+            // Get chunk content - check if it exists before trying to access
+            if (!patternData.inputChunks.chunks[newIndex]) {
+                console.error(`[${methodName}] Chunk at index ${newIndex} doesn't exist!`);
+                await adapter.answerCallbackQuery('Error: Chunk does not exist');
+                return;
+            }
+
+            const chunkContent = patternData.inputChunks.chunks[newIndex];
+            console.log(`[${methodName}] Displaying chunk ${newIndex + 1} of ${patternData.inputChunks.chunks.length}, length: ${chunkContent.length}`);
+
+            // Update message with the chunk content
             await adapter.editMessageText(
-                `${patternData.inputChunks.chunks[newIndex]}\n\n-----\n📝 <b>Input Chunk ${newIndex + 1} of ${patternData.inputChunks.chunks.length}</b>`,
+                `${chunkContent}\n\n` +
+                `-----\n` +
+                `📝 <b>Input Chunk ${newIndex + 1} of ${patternData.inputChunks.chunks.length}</b>`,
                 {
                     parse_mode: 'HTML',
                     reply_markup: keyboard
@@ -2279,9 +2624,15 @@ export class CommandHandler {
         } catch (error) {
             console.error(`[${methodName}] Error displaying input chunk:`, error);
             await adapter.answerCallbackQuery('Error displaying input chunk');
+
+            // Try to recover with a simple message
+            try {
+                await adapter.reply(`Error displaying chunk ${newIndex + 1}. Please try navigating again.`);
+            } catch (replyError) {
+                console.error(`[${methodName}] Error sending recovery message:`, replyError);
+            }
         }
     }
-
     private async showPatternMenuForChunk(
         adapter: ContextAdapter,
         userId: string,
@@ -2405,34 +2756,34 @@ export class CommandHandler {
         index: number
     ): Promise<void> {
         const methodName = 'viewBatchResult';
-        
+
         const patternData = this.conversationManager!.cache.get<PatternData>(`pattern_data:${userId}`);
         if (!patternData || !patternData.processedOutputs[batchKey]) {
             await adapter.answerCallbackQuery('Batch results not available');
             return;
         }
-        
+
         const batch = patternData.processedOutputs[batchKey];
         if (!batch.batchResults || !Array.isArray(batch.batchResults)) {
             await adapter.answerCallbackQuery('Invalid batch data format');
             return;
         }
-        
+
         const results = batch.batchResults;
         if (index < 0 || index >= results.length) {
             await adapter.answerCallbackQuery('Result index out of range');
             return;
         }
-        
+
         const result = results[index];
-        
+
         // Use MenuManager to create the batch result navigation menu
         const keyboard = this.menuManager!.createBatchResultNavigationMenu(
             batchKey,
             index,
             results.length
         ).reply_markup;
-        
+
         // Send the result
         await adapter.reply(
             `<b>Chunk ${index + 1} Result:</b>\n\n${result}`,
@@ -2441,7 +2792,7 @@ export class CommandHandler {
                 reply_markup: keyboard
             }
         );
-        
+
         await adapter.answerCallbackQuery(`Showing result for chunk ${index + 1}`);
     }
 
@@ -2451,38 +2802,45 @@ export class CommandHandler {
         messageId?: number | string
     ): Promise<void> {
         const methodName = 'showPatternMenuForAllChunks';
-        
+
         const patternData = this.conversationManager!.cache.get<PatternData>(`pattern_data:${userId}`);
         if (!patternData) {
             await adapter.answerCallbackQuery('Pattern data not available');
             return;
         }
-        
+
         // Ensure input chunks exist
         if (!patternData.inputChunks?.chunks || patternData.inputChunks.chunks.length === 0) {
             // If no chunks yet, create them
+            console.warn(`[${methodName}] No existing chunks found, creating chunks from original input`);
             if (patternData.originalInput) {
+                const newChunks = this.splitInput(patternData.originalInput);
+                console.warn(`[${methodName}] Created ${newChunks.length} chunks from original input of length ${patternData.originalInput.length}`);
                 patternData.inputChunks = {
-                    chunks: this.splitInput(patternData.originalInput),
+                    chunks: newChunks,
                     currentChunk: 0,
                     lastAccessed: Date.now()
                 };
+                console.warn(`[${methodName}] First chunk preview: "${newChunks[0]?.substring(0, 50)}..."`);
+
                 this.conversationManager!.cache.set(`pattern_data:${userId}`, patternData, 3600);
             } else {
+                console.warn(`[${methodName}] No original input available to create chunks`);
+
                 await adapter.answerCallbackQuery('No input content available for chunking');
                 return;
             }
         }
-        
+
         const chunkCount = patternData.inputChunks.chunks.length;
-        
+
         // Use MenuManager to create the batch processing menu
         const keyboard = this.menuManager!.createBatchProcessingMenu(chunkCount).reply_markup;
-        
+
         const message = `📝 <b>Batch Process All Chunks</b>\n\n` +
-                       `The content has been split into ${chunkCount} chunks.\n\n` +
-                       `Select a pattern to apply to all chunks:`;
-        
+            `The content has been split into ${chunkCount} chunks.\n\n` +
+            `Select a pattern to apply to all chunks:`;
+
         try {
             if (messageId) {
                 await adapter.editMessageText(
@@ -2511,25 +2869,25 @@ export class CommandHandler {
         messageId?: number | string
     ): Promise<void> {
         const methodName = 'showProcessedOutputsMenu';
-        
+
         const patternData = this.conversationManager!.cache.get<PatternData>(`pattern_data:${userId}`);
         if (!patternData || !patternData.processedOutputs) {
             await adapter.answerCallbackQuery('No processed outputs available');
             return;
         }
-        
+
         const outputPatterns = Object.keys(patternData.processedOutputs);
         if (outputPatterns.length === 0) {
             await adapter.answerCallbackQuery('No processed outputs available');
             return;
         }
-        
+
         // Use MenuManager to create the processed outputs menu
         const keyboard = this.menuManager!.createProcessedOutputsMenu(outputPatterns).reply_markup;
-        
+
         const message = `📝 <b>Choose a Processed Result</b>\n\n` +
-                       `Select a previous result to use as input for a new pattern:`;
-        
+            `Select a previous result to use as input for a new pattern:`;
+
         try {
             if (messageId) {
                 await adapter.editMessageText(
@@ -2644,6 +3002,132 @@ export class CommandHandler {
         this.conversationManager!.cache.set(cacheKey, patternData, 7200);
 
         console.log(`[storePatternOutput] Stored output for pattern ${patternName}, user ${userId}, length: ${output.length}`);
+    }
+
+
+    public async handleYouTubeAction(adapter: ContextAdapter, videoId: string, youtubeAction: string): Promise<void> {
+        const methodName = 'handleYouTubeAction';
+        console.log(`[${methodName}] Processing action for videoId: ${videoId}, action: ${youtubeAction}`);
+
+        try {
+            // Get user ID for storing content
+            const { userId } = await this.conversationManager!.getSessionInfo(adapter);
+
+            // Show loading message
+            await adapter.reply("⏳ Fetching content from YouTube... This may take a moment.");
+
+            // Map the action to the tool action
+            const actionMap: { [key: string]: string } = {
+                'transcript': 'transcript',
+                'timestamps': 'transcript_with_timestamps',
+                'metadata': 'metadata',
+                'comments': 'comments'
+            };
+
+            const toolAction = actionMap[youtubeAction] || 'transcript';
+
+            // Get the tool manager using our helper method
+            const toolManager = this.getToolManager();
+            if (!toolManager) {
+                throw new Error('ToolManager is not available');
+            }
+
+            // Check if YouTube tool is available
+            const toolNames = toolManager.getToolNames();
+            const hasYouTubeTool = toolNames.includes('youtube_tool');
+
+            if (!hasYouTubeTool) {
+                await adapter.reply("❌ YouTube tool is not available. Please check your configuration.");
+                return;
+            }
+
+            // Prepare the input for the tool
+            const input = JSON.stringify({
+                url: `https://youtube.com/watch?v=${videoId}`,
+                action: toolAction,
+                language: 'en'
+            });
+
+            // Call the tool
+            console.log(`[${methodName}] Executing YouTube tool with action: ${toolAction}`);
+            const result = await toolManager.executeTool('youtube_tool', input);
+
+
+            // Check for errors
+            if (result.startsWith('Error:')) {
+                await adapter.reply(`❌ ${result}`);
+                return;
+            }
+
+            // Create pattern data for future processing
+            const patternDataKey = `pattern_data:${userId}`;
+            let patternData = this.conversationManager!.cache.get<PatternData>(patternDataKey) || {
+                originalInput: '',
+                processedOutputs: {},
+                currentPatternState: {}
+            };
+
+            // Store the result as originalInput for pattern processing
+            patternData.originalInput = result;
+            this.conversationManager!.cache.set(patternDataKey, patternData, 7200);
+
+            // For storing in context cache for pattern suggestions
+            const contextData = {
+                input: result,
+                interactionType: 'general_input',
+                contextRequirement: 'chat',
+                timestamp: Date.now(),
+            };
+            this.conversationManager!.cache.set(`pattern_context:${userId}`, contextData, 1800);
+
+            // Format the content for display based on action
+            let response = "";
+            let parseMode: "HTML" | "Markdown" | undefined = undefined;
+
+            if (toolAction === 'metadata' || toolAction === 'comments') {
+                try {
+                    // Format JSON for display
+                    const parsed = JSON.parse(result);
+                    response = `📝 Retrieved ${youtubeAction} from YouTube video:\n\n`;
+                    response += "```json\n" + JSON.stringify(parsed, null, 2).substring(0, 3000) + "\n```";
+                    if (JSON.stringify(parsed, null, 2).length > 3000) {
+                        response += "\n\n[Content truncated for display]";
+                    }
+                    parseMode = "Markdown";
+                } catch (e) {
+                    response = result.substring(0, 3500);
+                    if (result.length > 3500) {
+                        response += "\n\n[Content truncated for display]";
+                    }
+                }
+            } else {
+                // For transcript, show a preview
+                const preview = result.length > 800 ?
+                    result.substring(0, 800) + "...\n\n[Content truncated for preview]" :
+                    result;
+
+                response = `📝 Retrieved ${youtubeAction} from YouTube video:\n\n${preview}`;
+            }
+
+            // Create pattern buttons - specifically for YouTube content
+            const buttons = [
+                [{ text: "📝 Summarize Transcript", callback_data: "pattern_use:summarize_youtube_transcript" }],
+                [{ text: "🔍 Analyze Video Content", callback_data: "pattern_use:analyze_youtube_video" }],
+                [{ text: "📋 Apply Other Patterns", callback_data: "pattern_more" }]
+            ];
+
+            // Send the response with pattern buttons
+            await adapter.reply(response, {
+                parse_mode: parseMode,
+                reply_markup: {
+                    inline_keyboard: buttons
+                }
+            });
+
+        } catch (error) {
+            console.error(`[${methodName}] Error:`, error);
+            await adapter.reply(`❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
 
 }

@@ -3555,5 +3555,6 @@ export class ConversationManager {
         console.log(`[storePatternInput] Stored input for user ${userId}, length: ${input.length}`);
     }
 
+    
 }
 //export const splitAndTruncateMessage = ConversationManager.splitAndTruncateMessage;

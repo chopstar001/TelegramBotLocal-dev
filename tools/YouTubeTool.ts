@@ -42,7 +42,7 @@ export class YouTubeTool extends Tool {
             }
 
             // Normalize video ID (ensure lowercase for case-insensitive comparison)
-            const normalizedVideoId = videoId.toLowerCase();
+            const normalizedVideoId = videoId;
             console.log(`Normalized video ID: "${normalizedVideoId}"`);
             
             // First, check if the video exists before doing anything else
@@ -54,31 +54,38 @@ export class YouTubeTool extends Tool {
             switch (action) {
                 case 'transcript': {
                     const transcript = await this.getImprovedTranscript(normalizedVideoId, language, false);
-                    return transcript;
+                    return this.cleanHTMLForTelegram(transcript);
                 }
                 case 'transcript_with_timestamps': {
                     const transcript = await this.getImprovedTranscript(normalizedVideoId, language, true);
-                    return transcript;
+                    return this.cleanHTMLForTelegram(transcript);
                 }
-                case 'metadata':
-                    return await this.getMetadata(normalizedVideoId);
-                case 'comments':
-                    return await this.getComments(normalizedVideoId);
-                case 'all': {
+                case 'metadata': {
+                    // Remove the pageData parameter
                     const metadata = await this.getMetadata(normalizedVideoId);
-                    // Get metadata first to check if video exists and is accessible
+                    // No need to clean JSON metadata
+                    return metadata;
+                }
+                case 'comments': {
+                    const comments = await this.getComments(normalizedVideoId);
+                    // No need to clean JSON comments
+                    return comments;
+                }
+                case 'all': {
+                    // Remove the pageData parameter
+                    const metadata = await this.getMetadata(normalizedVideoId);
                     const metadataObj = JSON.parse(metadata);
                     
                     const transcript = await this.getImprovedTranscript(normalizedVideoId, language, false);
+                    // Clean the transcript
+                    const cleanedTranscript = transcript.startsWith("No transcript found") 
+                        ? transcript
+                        : this.cleanHTMLForTelegram(transcript);
+                    
                     const comments = await this.getComments(normalizedVideoId);
                     
-                    // Handle case where transcript isn't available
-                    const transcriptResponse = transcript.startsWith("No transcript found") 
-                        ? "No transcript available for this video."
-                        : transcript;
-                    
                     return JSON.stringify({
-                        transcript: transcriptResponse,
+                        transcript: cleanedTranscript,
                         metadata: metadataObj,
                         comments: JSON.parse(comments)
                     }, null, 2);
@@ -149,7 +156,17 @@ export class YouTubeTool extends Tool {
         
         console.log(`Extracting video ID from: "${url}"`);
         
-        // First try the standard regex pattern
+        // Handle YouTube live URLs specifically
+        const liveMatch = url.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/live\/)([a-zA-Z0-9_-]+)/i);
+        if (liveMatch && liveMatch[1]) {
+            console.log(`Extracted ID from live URL: "${liveMatch[1]}"`);
+            // Verify it's a valid 11-character ID
+            if (liveMatch[1].length === 11) {
+                return liveMatch[1];
+            }
+        }
+        
+        // Standard video URL pattern
         const videoPattern = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|(?:s(?:horts)\/)|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/i;
         const match = url.match(videoPattern);
         
@@ -194,7 +211,7 @@ export class YouTubeTool extends Tool {
                 console.log(`Direct transcript extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
             }
             
-            // Method 2: Try using youtube-caption-extractor
+            // Method 2: Try using youtube-caption-extractor - This seems to work the most
             try {
                 console.log(`Trying youtube-caption-extractor for language: ${lang}`);
                 const subtitles = await getSubtitles({
@@ -317,7 +334,7 @@ export class YouTubeTool extends Tool {
             
             // First try the JSON approach
             console.log("Trying to extract caption tracks from page data");
-            const captionRegex = /"captionTracks":(\[.*?\]),"translationLanguages"/;
+            const captionRegex = /"captionTracks":(\[.*?\])\s*,\s*"translationLanguages"/;
             const match = html.match(captionRegex);
             
             if (!match || !match[1]) {
@@ -399,12 +416,13 @@ export class YouTubeTool extends Tool {
                 const startTime = parseFloat(result[1]);
                 const duration = parseFloat(result[2]);
                 const endTime = startTime + duration;
-                const text = result[3]
+                const rawText = result[3]
                     .replace(/&amp;/g, '&')
                     .replace(/&lt;/g, '<')
                     .replace(/&gt;/g, '>')
                     .replace(/&quot;/g, '"')
                     .replace(/&#39;/g, "'");
+                const text = rawText.replace(/<\/?[^>]+(>|$)/g, "");
                 
                 lines.push({
                     startTime,
@@ -705,5 +723,35 @@ export class YouTubeTool extends Tool {
             throw error;
         }
     }
+/**
+ * Converts HTML to a format Telegram can understand (for safe display)
+ */
+private cleanHTMLForTelegram(html: string): string {
+    // Replace paragraph tags with newlines
+    let result = html.replace(/<\/?p>/g, '\n');
     
+    // Replace lists with simple formatting
+    result = result.replace(/<ul>([\s\S]*?)<\/ul>/g, (match, content) => {
+        return content.replace(/<li>([\s\S]*?)<\/li>/g, '• $1\n');
+    });
+    
+    result = result.replace(/<ol>([\s\S]*?)<\/ol>/g, (match, content) => {
+        let index = 1;
+        return content.replace(/<li>([\s\S]*?)<\/li>/g, () => {
+            return `${index++}. $1\n`;
+        });
+    });
+    
+    // Preserve basic formatting that Telegram supports
+    // Telegram supports <b>, <i>, <u>, <s>, <a>, <code>, <pre>
+    
+    // Remove any other HTML tags
+    result = result.replace(/<(?!\/?(b|i|u|s|a|code|pre))[^>]*>/g, '');
+    
+    // Clean up excessive newlines
+    result = result.replace(/\n{3,}/g, '\n\n');
+    
+    return result.trim();
+}
+
 }

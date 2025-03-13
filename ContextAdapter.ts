@@ -1,7 +1,8 @@
 // ContextAdapter.ts
 import { MessageContext, TelegramParseMode, PhotoMessageOptions, MessageResponse, PhotoSource, InputMedia, EditMessageMediaOptions } from './commands/types';
 import { PromptManager } from './PromptManager';
-import { Context, Telegraf } from 'telegraf';
+import { TelegramBot_Agents } from './TelegramBot_Agents';
+import { Context, Telegraf, Telegram } from 'telegraf';
 import { Update, Message, Chat, CallbackQuery, InputFile } from 'telegraf/typings/core/types/typegram';
 import { ExtraEditMessageText, ExtraReplyMessage } from 'telegraf/typings/telegram-types';
 import { FmtString } from 'telegraf/typings/format';
@@ -9,6 +10,8 @@ import { FormatConverter } from './utils/FormatConverter';
 import { ReadStream, createReadStream, existsSync } from 'fs';
 import * as fs from 'fs/promises';
 import * as fsPromises from 'fs/promises';
+import { ConversationManager } from './ConversationManager';
+
 
 
 
@@ -33,6 +36,9 @@ export class ContextAdapter {
     public chat?: Chat;
     public botInfo: Context['botInfo'];
     private promptManager: PromptManager | null;
+    private conversationManager: ConversationManager | null = null;
+
+
 
     constructor(input: Context<Update> | MessageContext, promptManager: PromptManager | null) {
         if (this.isTelegramContext(input)) {
@@ -51,37 +57,37 @@ export class ContextAdapter {
             this.context = input;
 
             // Important fix: If this is a telegram message from a custom context
-        if (input.source === 'telegram') {
-            // Try to extract telegram object from the raw data
-            // To avoid type issues, access properties more carefully
-            const rawObj = input.raw as any;
-            
-            // Check if we can find the telegram client in the raw field
-            if (rawObj && typeof rawObj === 'object') {
-                if ('telegram' in rawObj && 'update' in rawObj) {
-                    // This might be a Telegraf context
-                    this.telegramContext = rawObj as Context<Update>;
-                    console.log('[ContextAdapter] Found telegramContext in raw field');
-                } else if (rawObj.message && rawObj.chat) {
-                    // We have enough pieces to use the telegram API
-                    // Create a minimal telegram context for API calls
-                    const botInfo = input.raw?.botInfo;
-                    
-                    // We need to create a minimal Telegram context that can send messages
-                    if (this.bot && this.bot.telegram) {
-                        // If we have access to the bot instance
-                        this.telegramContext = {
-                            telegram: this.bot.telegram,
-                            botInfo: botInfo,
-                            chat: rawObj.chat,
-                            message: rawObj.message
-                        } as unknown as Context<Update>;
-                        
-                        console.log('[ContextAdapter] Created minimal telegramContext');
+            if (input.source === 'telegram') {
+                // Try to extract telegram object from the raw data
+                // To avoid type issues, access properties more carefully
+                const rawObj = input.raw as any;
+
+                // Check if we can find the telegram client in the raw field
+                if (rawObj && typeof rawObj === 'object') {
+                    if ('telegram' in rawObj && 'update' in rawObj) {
+                        // This might be a Telegraf context
+                        this.telegramContext = rawObj as Context<Update>;
+                        console.log('[ContextAdapter] Found telegramContext in raw field');
+                    } else if (rawObj.message && rawObj.chat) {
+                        // We have enough pieces to use the telegram API
+                        // Create a minimal telegram context for API calls
+                        const botInfo = input.raw?.botInfo;
+
+                        // We need to create a minimal Telegram context that can send messages
+                        if (this.bot && this.bot.telegram) {
+                            // If we have access to the bot instance
+                            this.telegramContext = {
+                                telegram: this.bot.telegram,
+                                botInfo: botInfo,
+                                chat: rawObj.chat,
+                                message: rawObj.message
+                            } as unknown as Context<Update>;
+
+                            console.log('[ContextAdapter] Created minimal telegramContext');
+                        }
                     }
                 }
             }
-        }
 
             this.chat = this.convertChat(input.raw?.chat);
             this.botInfo = input.raw?.botInfo;
@@ -192,7 +198,7 @@ export class ContextAdapter {
 
     public async reply(text: string, options?: { replyToMessageId?: number, reply_markup?: any, parse_mode?: 'HTML' | 'Markdown' | 'MarkdownV2' }): Promise<{ message_id: number }> {
         console.log('ContextAdapter.ts: [Entering: reply]: PromptManager state:', this.promptManager ? 'Initialized' : 'Not initialized');
-
+    
         if (this.context.source === 'telegram' && this.context.raw && 'reply' in this.context.raw) {
             try {
                 let chunks: string[];
@@ -204,25 +210,43 @@ export class ContextAdapter {
                     console.warn('PromptManager is not initialized. Sending message without splitting.');
                     chunks = [text];
                 }
-
+    
                 let lastSentMessage;
                 for (let i = 0; i < chunks.length; i++) {
                     console.warn(`[reply] Sending chunk ${i + 1}/${chunks.length}, length: ${chunks[i].length}`);
-                    // Clean up any unsupported tags before formatting
-                    let cleanChunk = chunks[i].replace(/<\/?think>/g, '');
-                    let formattedChunk = FormatConverter.genericToHTML(cleanChunk);
-                    console.warn(`[reply] Chunk ${i + 1} sent successfully`);
-
+                    
+                    // Clean up any unsupported tags before sending
+                    const cleanChunk = this.cleanHtmlForTelegram(chunks[i]);
+                    
+                    // Replace <think> tags specifically (these might be used in internal processing)
+                    const formattedChunk = cleanChunk.replace(/<\/?think>/g, '');
+                    
+                    console.warn(`[reply] Cleaned chunk, new length: ${formattedChunk.length}`);
+    
                     const extra: any = {
-                        parse_mode: 'HTML',
+                        parse_mode: options?.parse_mode || 'HTML',
                         reply_to_message_id: i === 0 ? options?.replyToMessageId : undefined
                     };
+                    
                     if (options?.reply_markup) {
                         extra.reply_markup = options.reply_markup;
                     }
-
-                    lastSentMessage = await this.context.raw.telegram.sendMessage(this.context.chatId, formattedChunk, extra);
-
+    
+                    try {
+                        lastSentMessage = await this.context.raw.telegram.sendMessage(this.context.chatId, formattedChunk, extra);
+                        console.warn(`[reply] Chunk ${i + 1} sent successfully`);
+                    } catch (sendError) {
+                        // If HTML parsing fails, try sending without parse_mode
+                        if (sendError.description && sendError.description.includes("can't parse entities")) {
+                            console.warn(`[reply] HTML parsing failed, trying without formatting: ${sendError.description}`);
+                            // Try again without HTML parsing
+                            extra.parse_mode = undefined;
+                            lastSentMessage = await this.context.raw.telegram.sendMessage(this.context.chatId, formattedChunk, extra);
+                        } else {
+                            throw sendError;
+                        }
+                    }
+    
                     if (i < chunks.length - 1) {
                         await new Promise(resolve => setTimeout(resolve, 100));
                     }
@@ -230,7 +254,17 @@ export class ContextAdapter {
                 return lastSentMessage;
             } catch (error) {
                 console.error('[reply] Error details:', error);
-                return await this.context.raw.telegram.sendMessage(this.context.chatId, "Sorry, I encountered an error while sending the message.");
+                
+                // Attempt to send a plain text message without any formatting as a fallback
+                try {
+                    return await this.context.raw.telegram.sendMessage(
+                        this.context.chatId, 
+                        "Sorry, I encountered an error while formatting the message. Please try again."
+                    );
+                } catch (fallbackError) {
+                    console.error('[reply] Even fallback message failed:', fallbackError);
+                    throw error; // Re-throw the original error if fallback fails
+                }
             }
         } else {
             // For non-Telegram sources (e.g., Flowise)
@@ -269,14 +303,7 @@ export class ContextAdapter {
             }
         }
     }
-    public isTelegramMessage(): boolean {
-        console.log('[ContextAdapter:isTelegramMessage] Checking message source:', {
-            source: this.context.source,
-            hasTelegramContext: !!this.telegramContext,
-            contextType: this.context.raw ? typeof this.context.raw : 'undefined'
-        });
-        return this.context.source === 'telegram' && !!this.telegramContext;
-    }
+
 
     public async updateProgress(flowId: string, progressKey: string, stage: string): Promise<boolean> {
         console.log(`[ContextAdapter:${flowId}] Attempting to update progress: ${stage}`);
@@ -291,7 +318,7 @@ export class ContextAdapter {
         const [, messageId] = progressKey.split(':');
 
         if (!chatId || !messageId) {
-            console.error(`[ContextAdapter:${flowId}] Invalid progressKey: ${progressKey}`);
+            console.error(`[ContextAdapter:${flowId}] Invalid progressKey: ${progressKey} for chatId: ${chatId} and messageId: ${messageId}`);
             return false;
         }
 
@@ -316,7 +343,7 @@ export class ContextAdapter {
                 console.log(`[ContextAdapter:${flowId}] Message content unchanged, considered as successful update`);
                 return true;
             } else {
-                console.error(`[ContextAdapter:${flowId}] Error updating progress message:`, error);
+                console.error(`[ContextAdapter:${flowId}] Error updating progress message  for chatId: ${chatId} and messageId: ${messageId}:`, error);
                 return false;
             }
         }
@@ -330,7 +357,7 @@ export class ContextAdapter {
         if (this.context.raw && 'editMessageText' in this.context.raw) {
             const ctx = this.context.raw as Context;
             let lastError;
-            
+
             // Try up to maxRetries times
             for (let attempt = 0; attempt < maxRetries; attempt++) {
                 try {
@@ -356,11 +383,11 @@ export class ContextAdapter {
                 } catch (error) {
                     lastError = error;
                     console.warn(`[ContextAdapter] Error editing message on attempt ${attempt + 1}:`, error);
-                    
+
                     // For network errors, wait and retry
                     if (
-                        error.code === 'ECONNRESET' || 
-                        error.code === 'ETIMEDOUT' || 
+                        error.code === 'ECONNRESET' ||
+                        error.code === 'ETIMEDOUT' ||
                         error.type === 'system' ||
                         (error.message && error.message.includes('ECONNRESET'))
                     ) {
@@ -370,12 +397,12 @@ export class ContextAdapter {
                         await new Promise(resolve => setTimeout(resolve, waitTime));
                         continue;
                     }
-                    
+
                     // For other errors (like message not found or content issues), don't retry
                     break;
                 }
             }
-            
+
             // If we got here, all retries failed
             console.error(`[ContextAdapter] All ${maxRetries} attempts to edit message failed`);
             return undefined;
@@ -757,5 +784,87 @@ export class ContextAdapter {
     private getDeleteTime(messageType: string): number {
         return this.messageAutoDeleteTimes[messageType] || 60000; // Default to 1 minute
     }
+
+    /*
+    public isTelegramMessage(): boolean {
+        console.log('[ContextAdapter:isTelegramMessage] Checking message source:', {
+            source: this.context.source,
+            hasTelegramContext: !!this.telegramContext,
+            contextType: this.context.raw ? typeof this.context.raw : 'undefined'
+        });
+        return this.context.source === 'telegram' && !!this.telegramContext;
+    }s
+        */
+    // Helper method to check if this is a Telegram message context
+    public isTelegramMessage(): boolean {
+        const context = this.getMessageContext();
+        const hasTelegramContext = !!this.context && typeof this.context === 'object';
+
+        console.log(`[ContextAdapter:isTelegramMessage] Checking message source: { source: '${context.source}', hasTelegramContext: ${hasTelegramContext}, contextType: '${typeof this.context}' }`);
+
+        return context.source === 'telegram' && hasTelegramContext;
+    }
+    /**
+     * Cleans HTML content to be compatible with Telegram's limited HTML support
+     * Telegram only supports: <b>, <i>, <u>, <s>, <a>, <code>, <pre>
+     */
+    private cleanHtmlForTelegram(html: string): string {
+        if (!html) return '';
+    
+        // Replace <br> tags with newlines
+        let cleaned = html.replace(/<br\s*\/?>/gi, '\n');
+    
+        // Replace lists with simpler formats
+        cleaned = cleaned.replace(/<ul>([\s\S]*?)<\/ul>/gi, function(match: string, content: string) {
+            return content.replace(/<li>([\s\S]*?)<\/li>/gi, '• $1\n');
+        });
+    
+        cleaned = cleaned.replace(/<ol>([\s\S]*?)<\/ol>/gi, function(match: string, content: string) {
+            let index = 1;
+            return content.replace(/<li>([\s\S]*?)<\/li>/gi, function(m: string, item: string) {
+                return `${index++}. ${item}\n`;
+            });
+        });
+    
+        // Keep only supported HTML tags
+        // Telegram only supports <b>, <i>, <u>, <s>, <a>, <code>, <pre>
+        const supportedTagsRegex = /<(?!\/?(?:b|i|u|s|a|code|pre)\b)[^>]+>/gi;
+        cleaned = cleaned.replace(supportedTagsRegex, '');
+    
+        // Remove consecutive newlines (more than 2)
+        cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+    
+        return cleaned;
+    }
+
+    // Add to ContextAdapter.ts
+
+/**
+ * Edits the reply markup of a message
+ * @param messageId Message ID to edit
+ * @param replyMarkup New reply markup, or undefined to remove markup
+ * @returns Result of the edit operation
+ */
+public async editMessageReplyMarkup(
+    messageId: number, 
+    replyMarkup?: any
+): Promise<any> {
+    if (this.isTelegramMessage() && this.telegramContext) {
+        try {
+            return await this.telegramContext.telegram.editMessageReplyMarkup(
+                this.context.chatId,
+                messageId,
+                undefined,
+                replyMarkup
+            );
+        } catch (error) {
+            console.error('Error editing message reply markup:', error);
+            return false;
+        }
+    } else {
+        console.log(`Simulating editMessageReplyMarkup for message ${messageId}`);
+        return true;
+    }
+}
     // Add more methods as needed, with platform-specific handling
 }

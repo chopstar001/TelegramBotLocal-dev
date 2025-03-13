@@ -338,10 +338,11 @@ export class MenuManager {
             ],
             [
                 Markup.button.callback('🔍 Apply Pattern to This Chunk', `pattern_apply_to_chunk:${patternName}:${currentChunk}`),
-                Markup.button.callback('📤 Download', `pattern_download:${patternName}`)
+                Markup.button.callback('📄 Download as Text', `pattern_download:${patternName}:text`),
+                Markup.button.callback('📑 Download as PDF', `pattern_download:${patternName}:pdf`)
             ],
             [
-                Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
+                Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
                 Markup.button.callback('✅ Done', 'pattern_skip')
             ]
         ];
@@ -403,10 +404,15 @@ export class MenuManager {
             Markup.button.callback(`${standardPatterns[1].emoji} Improve`, `pattern_use:${standardPatterns[1].name}`)
         ]);
 
+        buttons.push([
+            Markup.button.callback('📄 Download as Text', `pattern_download:original:text`),
+            Markup.button.callback('📑 Download as PDF', `pattern_download:original:pdf`)
+        ]);
+
         // Navigation buttons
         buttons.push([
             Markup.button.callback('📋 More Patterns', 'pattern_more'),
-            Markup.button.callback('📋 Back to Patterns', 'pattern_back_to_menu'),
+            Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
             Markup.button.callback('⏭️ Process Normally', 'pattern_skip')
         ]);
 
@@ -457,7 +463,7 @@ export class MenuManager {
         // Navigation buttons
         buttons.push([
             Markup.button.callback('📋 More Patterns', 'pattern_more'),
-            Markup.button.callback('🔙 Back', 'pattern_back_to_menu'),
+            Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
             Markup.button.callback('✅ Done', 'pattern_skip')
         ]);
 
@@ -496,7 +502,7 @@ export class MenuManager {
         // Add navigation buttons
         buttons.push([
             Markup.button.callback('🔙 Back', 'pattern_advanced'),
-            Markup.button.callback('📋 Back to Patterns', 'pattern_back_to_menu'),
+            Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
             Markup.button.callback('✅ Done', 'pattern_skip')
         ]);
 
@@ -509,30 +515,61 @@ export class MenuManager {
     createBatchProcessingMenu(
         chunkCount: number
     ): Markup.Markup<InlineKeyboardMarkup> {
-        const batchPatterns = [
-            { name: 'summarize', emoji: '📝', description: 'Create summaries of each chunk' },
-            { name: 'extract_wisdom', emoji: '💡', description: 'Extract key insights from each chunk' },
-            { name: 'improve_writing', emoji: '✍️', description: 'Improve the writing of each chunk' }
-        ];
-
+        const methodName = 'createBatchProcessingMenu';
+        console.log(`[${methodName}] Creating menu for ${chunkCount} chunks`);
+        
         const buttons = [];
-
-        // Add pattern buttons
-        for (const pattern of batchPatterns) {
-            buttons.push([
-                Markup.button.callback(
-                    `${pattern.emoji} ${pattern.name} all chunks`,
-                    `pattern_process_all:${pattern.name}`
-                )
-            ]);
+        
+        // Add a header row with information
+        buttons.push([
+            Markup.button.callback(`📊 Process ${chunkCount} Chunks`, 'pattern_noop')
+        ]);
+        
+        // Most common patterns in first row (2 per row)
+        const commonPatterns = [
+            { name: 'summarize', emoji: '📝', description: 'Summarize content' },
+            { name: 'extract_insights', emoji: '💡', description: 'Extract key insights' },
+            { name: 'improve_writing', emoji: '✍️', description: 'Improve writing style' },
+            { name: 'analyze_content', emoji: '🔍', description: 'Analyze content' }
+        ];
+        
+        // Add common patterns (2 per row)
+        for (let i = 0; i < commonPatterns.length; i += 2) {
+            const row = [];
+            
+            row.push(Markup.button.callback(
+                `${commonPatterns[i].emoji} ${commonPatterns[i].name}`,
+                `pattern_process_all:${commonPatterns[i].name}`
+            ));
+            
+            if (i + 1 < commonPatterns.length) {
+                row.push(Markup.button.callback(
+                    `${commonPatterns[i+1].emoji} ${commonPatterns[i+1].name}`,
+                    `pattern_process_all:${commonPatterns[i+1].name}`
+                ));
+            }
+            
+            buttons.push(row);
         }
-
+        
+        // Download options row for the merged content
+        buttons.push([
+            Markup.button.callback('📄 Download as Text', `pattern_download:merged_chunks:text`),
+            Markup.button.callback('📑 Download as PDF', `pattern_download:merged_chunks:pdf`)
+        ]);
+        
+        // Additional options row
+        buttons.push([
+            Markup.button.callback('📋 More Patterns', 'pattern_more'),
+            Markup.button.callback('🧩 Advanced', 'pattern_advanced')
+        ]);
+        
         // Navigation buttons
         buttons.push([
             Markup.button.callback('🔙 Back', 'pattern_browse_input'),
             Markup.button.callback('✅ Done', 'pattern_skip')
         ]);
-
+        
         return Markup.inlineKeyboard(buttons);
     }
 
@@ -582,7 +619,7 @@ export class MenuManager {
             [Markup.button.callback('🔍 View Results', `pattern_view_batch:${batchKey}:0`)],
             [
                 Markup.button.callback('🔙 Back', 'pattern_select_all_chunks'),
-                Markup.button.callback('📋 Back to Patterns', 'pattern_back_to_menu'),
+                Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
                 Markup.button.callback('✅ Done', 'pattern_skip')
             ]
         ];
@@ -602,11 +639,11 @@ export class MenuManager {
         const navRow = [];
 
         if (includeBack) {
-            navRow.push(Markup.button.callback('⬅️ Back', 'pattern_back_to_menu'));
+            navRow.push(Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'));
         }
 
         if (includeHome) {
-            navRow.push(Markup.button.callback('🏠 Main Menu', 'pattern_categories'));
+            navRow.push(Markup.button.callback('🏠 Categories Menu', 'pattern_categories'));
         }
 
         if (includeCancel) {
@@ -631,7 +668,6 @@ export class MenuManager {
         alternativePatterns?: string[]
     ): Markup.Markup<InlineKeyboardMarkup> {
         const buttons = [];
-
         // Add main suggestion section if available
         if (originalSuggestion) {
             // Heading for recommended pattern (not a button)
@@ -662,16 +698,22 @@ export class MenuManager {
         // Common patterns section - organized by type
         buttons.push([
             Markup.button.callback(`📝 Summarize`, `pattern_use:summarize`),
-            Markup.button.callback(`🔍 Extract Insights`, `pattern_use:extract_wisdom`)
+            Markup.button.callback(`💡 Extract Insights`, `pattern_use:extract_insights`)
         ]);
 
         buttons.push([
             Markup.button.callback(`✍️ Improve Writing`, `pattern_use:improve_writing`),
-            Markup.button.callback(`📚 Create Essay`, `pattern_use:write_essay`)
+            Markup.button.callback(`🧘‍♀️ Extract Wisdom`, `pattern_use:extract_wisdom`)
+        ]);
+
+        buttons.push([
+            Markup.button.callback('📄 Download as Text', `pattern_download:original:text`),
+            Markup.button.callback('📑 Download as PDF', `pattern_download:original:pdf`)
         ]);
 
         // Navigation and advanced options
         const actionRow = [
+            Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
             Markup.button.callback('📋 More Patterns', 'pattern_more')
         ];
 
@@ -736,59 +778,64 @@ export class MenuManager {
         return Markup.inlineKeyboard(buttons);
     }
 
-    // In MenuManager.ts, update the createInputChunkNavigationMenu method
-    createInputChunkNavigationMenu(
-        currentChunk: number,
-        totalChunks: number
-    ): Markup.Markup<InlineKeyboardMarkup> {
-        const buttons = [];
-        
-        // Navigation controls
-        const navRow = [];
-        
-        // First/prev buttons
-        if (currentChunk > 0) {
-            navRow.push(Markup.button.callback('\u23ee\ufe0f First', `pattern_input_chunk:first`));
-            navRow.push(Markup.button.callback('\u25c0\ufe0f Prev', `pattern_input_chunk:prev`));
-        } else {
-            navRow.push(Markup.button.callback('\u23ee\ufe0f', 'pattern_noop'));
-            navRow.push(Markup.button.callback('\u25c0\ufe0f', 'pattern_noop'));
-        }
-        
-        // Progress indicator
-        const progressPercent = Math.round((currentChunk + 1) / totalChunks * 100);
-        navRow.push(Markup.button.callback(`${currentChunk + 1}/${totalChunks}`, 'pattern_noop'));
-        
-        // Next/last buttons
-        if (currentChunk < totalChunks - 1) {
-            navRow.push(Markup.button.callback('\u25b6\ufe0f Next', `pattern_input_chunk:next`));
-            navRow.push(Markup.button.callback('\u23ed\ufe0f Last', `pattern_input_chunk:last`));
-        } else {
-            navRow.push(Markup.button.callback('\u25b6\ufe0f', 'pattern_noop'));
-            navRow.push(Markup.button.callback('\u23ed\ufe0f', 'pattern_noop'));
-        }
-        
-        buttons.push(navRow);
-        
-        // Action buttons
-        buttons.push([
-            Markup.button.callback('\u2728 Process This Chunk', `pattern_select_chunk:${currentChunk}`)
-        ]);
-        
-        // Add batch processing option
-        buttons.push([
-            Markup.button.callback('\U0001f504 Process All Chunks', `pattern_select_all_chunks`)
-        ]);
-        
-        // Add navigation footer
-        buttons.push([
-            Markup.button.callback('\U0001f519 Back', 'pattern_back_to_menu'),
-            Markup.button.callback('\u2705 Done', 'pattern_skip')
-        ]);
-    
-        return Markup.inlineKeyboard(buttons);
+   // In MenuManager.ts - verify this is properly implemented
+createInputChunkNavigationMenu(
+    currentChunk: number,
+    totalChunks: number
+): Markup.Markup<InlineKeyboardMarkup> {
+    const buttons = [];
+
+    // Navigation controls
+    const navRow = [];
+
+    // First/prev buttons
+    if (currentChunk > 0) {
+        navRow.push(Markup.button.callback('⏮️ First', `pattern_input_chunk:first`));
+        navRow.push(Markup.button.callback('◀️ Prev', `pattern_input_chunk:prev`));
+    } else {
+        navRow.push(Markup.button.callback('⏮️', 'pattern_noop'));
+        navRow.push(Markup.button.callback('◀️', 'pattern_noop'));
     }
-    
+
+    // Progress indicator
+    navRow.push(Markup.button.callback(`${currentChunk + 1}/${totalChunks}`, 'pattern_noop'));
+
+    // Next/last buttons
+    if (currentChunk < totalChunks - 1) {
+        navRow.push(Markup.button.callback('▶️ Next', `pattern_input_chunk:next`));
+        navRow.push(Markup.button.callback('⏭️ Last', `pattern_input_chunk:last`));
+    } else {
+        navRow.push(Markup.button.callback('▶️', 'pattern_noop'));
+        navRow.push(Markup.button.callback('⏭️', 'pattern_noop'));
+    }
+
+    buttons.push(navRow);
+
+    // Action buttons for the current chunk
+    buttons.push([
+        Markup.button.callback('✨ Process This Chunk', `pattern_select_chunk:${currentChunk}`)
+    ]);
+
+    // Add batch processing option
+    buttons.push([
+        Markup.button.callback('🔄 Process All Chunks', `pattern_select_all_chunks`)
+    ]);
+
+    // Download options for this chunk
+    buttons.push([
+        Markup.button.callback('📄 Download This Chunk', `pattern_download:chunk_${currentChunk}:text`),
+        Markup.button.callback('📑 Download All Chunks', `pattern_download:merged_chunks:pdf`)
+    ]);
+
+    // Add navigation footer
+    buttons.push([
+        Markup.button.callback('🔙 Back', 'pattern_back_to_menu'),
+        Markup.button.callback('✅ Done', 'pattern_skip')
+    ]);
+
+    return Markup.inlineKeyboard(buttons);
+}
+
     // In MenuManager.ts, update the createOutputActionsMenu method
     createOutputActionsMenu(
         patternName: string
@@ -802,8 +849,9 @@ export class MenuManager {
 
         // Primary actions
         buttons.push([
-            Markup.button.callback('📋 Apply Another Pattern', 'pattern_back_to_menu'),
-            Markup.button.callback('💾 Save Result', `pattern_download:${patternName}`)
+            Markup.button.callback('🔝 Main Menu', 'pattern_back_to_menu'),
+            Markup.button.callback('📄 Download as Text', `pattern_download:${patternName}:text`),
+            Markup.button.callback('📑 Download as PDF', `pattern_download:${patternName}:pdf`)
         ]);
 
         // Secondary actions
@@ -820,5 +868,129 @@ export class MenuManager {
 
         return Markup.inlineKeyboard(buttons);
     }
+
+    // Add to MenuManager.ts
+
+    /**
+     * Creates a standardized chat menu with essential options
+     * @param isGroupChat Whether this is being shown in a group chat
+     * @param botId The current bot's ID
+     * @returns A markup object with the standardized menu
+     */
+    /**
+ * Creates a standardized chat menu with essential options
+ * @param isGroupChat Whether this is being shown in a group chat
+ * @param botId The current bot's ID
+ * @param context Optional context about the current message
+ * @returns A markup object with the standardized menu
+ */
+    createStandardChatMenu(
+        isGroupChat: boolean,
+        botId: number,
+        context?: {
+            isResponse?: boolean;
+            hasContent?: boolean;
+            contentLength?: number;
+            isRagEnabled?: boolean; // Add this new property
+        }
+    ): Markup.Markup<InlineKeyboardMarkup> {
+        const buttons = [];
+        
+        // First row - primary actions based on context
+        if (context?.isResponse) {
+            // If this is attached to a response, show response-specific actions
+            buttons.push([
+                Markup.button.callback('📝 Process with Pattern', `standard_menu:pattern:${botId}`),
+                Markup.button.callback(
+                    `RAG Mode: ${context.isRagEnabled ? '✅ ON' : '❌ OFF'}`, 
+                    `execute_command:${botId}:ragmode`
+                )
+            ]);
+    
+            buttons.push([
+                Markup.button.callback('📚 Sources', `standard_menu:sources:${botId}`),
+                Markup.button.callback('❓ Follow-up Q', `standard_menu:follow_up:${botId}`),
+            ]);
+    
+            // Third row - sources and download options
+            const thirdRow = [];
+    
+            // Add download options if response has significant content
+            if (context.hasContent && context.contentLength && context.contentLength > 200) {
+                thirdRow.push(
+                    Markup.button.callback('📄 Download as Text', `pattern_download:original:text`),
+                    Markup.button.callback('📑 Download as PDF', `pattern_download:original:pdf`),
+                );
+            }
+    
+            if (thirdRow.length > 0) {
+                buttons.push(thirdRow);
+            }
+        } else {
+            // Standard primary actions
+            buttons.push([
+                Markup.button.callback('💬 Ask Question', `standard_menu:query:${botId}`),
+                Markup.button.callback('📋 Commands', `standard_menu:commands:${botId}`),
+            ]);
+        }
+/*
+        // Last row - contextual options
+        if (isGroupChat) {
+            // Group chat options
+            buttons.push([
+                Markup.button.callback('🤖 Select Bot', `standard_menu:select_bot:${botId}`),
+                Markup.button.callback('⚙️ Settings', `standard_menu:settings:${botId}`)
+            ]);
+        } else {
+            // Private chat options
+            const lastRow = [
+                Markup.button.callback('⚙️ Settings', `standard_menu:settings:${botId}`)
+            ];
+
+            // Add help button in regular menu context
+            if (!context?.isResponse) {
+                lastRow.unshift(Markup.button.callback('❓ Help', `standard_menu:help:${botId}`));
+            }
+
+            buttons.push(lastRow);
+        }
+*/
+        return Markup.inlineKeyboard(buttons);
+    }
+    /**
+ * Sets a timeout to auto-hide the standard menu after inactivity
+ * @param adapter Context adapter
+ * @param messageId Message ID of the menu to hide
+ * @param timeout Timeout in milliseconds (default 15 minutes)
+ */
+    // Update in MenuManager.ts
+    setStandardMenuTimeout(adapter: ContextAdapter, messageId: number, timeout: number = 900000): void {
+        // Use the existing setMenuTimeout method if it exists
+        if (typeof this.setMenuTimeout === 'function') {
+            this.setMenuTimeout(adapter, messageId, timeout);
+            return;
+        }
+
+        // Fall back to our custom implementation if needed
+        const chatId = adapter.getMessageContext().chatId;
+        const menuKey = `${chatId}:${messageId}`;
+
+        // Clear any existing timeout
+        this.clearMenuTimeout(messageId);
+
+        // Set a new timeout
+        const timeoutId = setTimeout(async () => {
+            try {
+                // Edit the message to remove the menu
+                await adapter.editMessageReplyMarkup(messageId, undefined);
+                console.log(`Standard menu ${menuKey} auto-hidden after ${timeout / 1000} seconds`);
+            } catch (error) {
+                console.error(`Failed to auto-hide standard menu ${menuKey}:`, error);
+            }
+        }, timeout);
+
+        this.menuTimeouts.set(messageId, timeoutId);
+    }
+
 
 }

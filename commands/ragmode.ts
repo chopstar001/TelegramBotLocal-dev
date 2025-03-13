@@ -1,6 +1,6 @@
 import { Command } from './types';
 import { ConversationManager } from '../ConversationManager';
-import { IExtendedMemory, ExtendedIMessage } from './types';
+import { IExtendedMemory, ExtendedIMessage, MessageContext } from './types';
 import { MessageType } from '../../../../src/Interface';
 import { PromptManager } from '../PromptManager';
 import { RAGAgent } from '../agents/RAGAgent';
@@ -36,9 +36,80 @@ export const ragModeCommand: Command = {
         const newMode = !currentMode;
         ragAgent.toggleRAGMode(userId, newMode);
 
-        // Get the user's first name
+        // Get the context and check if this was called from a callback query
         const context = adapter.getMessageContext();
-        const userFirstName = context.username || 'User';
+        
+        // If this was called from a callback query, we should update the menu
+        if (adapter.isCallbackQuery() && adapter.context.raw?.callbackQuery?.message) {
+            // Answer the callback query first
+            await adapter.answerCallbackQuery(newMode ? "RAG Q&A mode has been turned on." : "RAG Q&A mode has been turned off.");
+            
+            // Get the message that contains the menu
+            const message = adapter.context.raw.callbackQuery.message;
+            const botId = telegramBot?.bot?.botInfo?.id;
+            
+            if (botId && telegramBot.menuManager) {
+                // Determine if this is a group chat
+                const chatType = getChatType(context);
+                const isGroupChat = chatType !== 'private';
+                
+                // Get the original message content
+                const messageText = 'text' in message ? message.text : '';
+                
+                try {
+                    // Create updated menu with new RAG status
+                    const updatedMenu = telegramBot.menuManager.createStandardChatMenu(
+                        isGroupChat,
+                        botId,
+                        {
+                            isResponse: true,
+                            hasContent: messageText.length > 0,
+                            contentLength: messageText.length,
+                            isRagEnabled: newMode
+                        }
+                    );
+                    
+                    // Update the message with the new menu
+                    await adapter.editMessageText(
+                        messageText,
+                        {
+                            parse_mode: 'HTML',
+                            reply_markup: updatedMenu.reply_markup
+                        }
+                    );
+                    
+                    logInfo(methodName, `Successfully refreshed menu with RAG mode: ${newMode ? 'ON' : 'OFF'}`);
+                    
+                    // Send a brief auto-delete confirmation message
+                    const confirmMessage = await adapter.reply(
+                        newMode 
+                            ? "✅ RAG mode enabled. I'll now use my knowledge base to provide more detailed answers."
+                            : "❌ RAG mode disabled. I'll now respond based on my general knowledge."
+                    );
+                    
+                    // Auto-delete the confirmation after 5 seconds
+                    setTimeout(async () => {
+                        try {
+                            await adapter.deleteMessage(confirmMessage.message_id);
+                        } catch (error) {
+                            logError(methodName, 'Error deleting confirmation message:', error);
+                        }
+                    }, 5000);
+                    
+                    // Return early since we've handled the response
+                    return;
+                } catch (error) {
+                    logError(methodName, 'Error refreshing menu:', error);
+                    // Fall through to standard reply if menu refresh fails
+                }
+            }
+        }
+        
+        // If we get here, either this wasn't a callback query or menu refresh failed
+        // Continue with the standard response as before
+        
+        // Get the user's first name for the reply
+        const userFirstName = context.first_name || 'User';
 
         const replyMessage = newMode
             ? `✅ RAG (Q&A) mode is now enabled for user: '${userFirstName}'. I will use contextual information to provide more detailed answers.`
@@ -70,26 +141,12 @@ export const ragModeCommand: Command = {
 
         logInfo(methodName, `RAG mode ${newMode ? 'enabled' : 'disabled'} for user ${userId} in session ${sessionId}`);
         
-        // Handle platform-specific responses
-        await handlePlatformSpecificResponse(
-            adapter,
-            async () => {
-                // Telegram-specific actions (if any)
-                // For example, updating inline keyboards or sending additional messages
-            },
-            [
-                { command: '/help', description: 'Show available commands' },
-                { command: '/start', description: 'Start the bot' },
-                // Add other relevant commands here
-            ]
-        );
-
-        // If this was called from a callback query (i.e., the "Toggle Off RAG Mode" button), answer the query
-        if (context.callbackQuery) {
+        // If this was called from a callback query but we didn't successfully refresh the menu
+        if (context.callbackQuery && !adapter.context.raw?.callbackQuery?.message) {
             await adapter.answerCallbackQuery(newMode ? "RAG Q&A mode has been turned on." : "RAG Q&A mode has been turned off.");
         }
 
-        // Optionally, you can add a message to indicate the chat type
+        // Optionally, message for group chats
         const chatType = context.raw?.chat?.type;
         if (chatType === 'group' || chatType === 'supergroup') {
             const groupMessage = await adapter.reply("👉 Note: RAG (Q&A) mode has been toggled in a group chat. This affects how I respond to your messages in this group.");
@@ -105,3 +162,17 @@ export const ragModeCommand: Command = {
         }
     }
 };
+
+// Helper function to properly get chat type from MessageContext
+function getChatType(context: MessageContext): 'private' | 'group' | 'supergroup' | 'channel' | undefined {
+    // First check in raw.chat
+    if (context.raw?.chat?.type) {
+        return context.raw.chat.type;
+    }
+    // Then check in raw.message.chat
+    if (context.raw?.message?.chat?.type) {
+        return context.raw.message.chat.type;
+    }
+    // If nothing found, default to undefined
+    return undefined;
+}

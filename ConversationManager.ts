@@ -7,6 +7,7 @@ import { BaseMessage, AIMessage, HumanMessage, SystemMessage } from '@langchain/
 import { Context, Telegraf, Markup } from 'telegraf';
 //import { Tool } from 'langchain/tools';
 import { AgentExecutor, createStructuredChatAgent } from 'langchain/agents';
+import { QuestionAnalyzer, QuestionAnalysisResult } from './QuestionAnalyzer';
 import {
     logDebug,
     logInfo,
@@ -25,7 +26,9 @@ import { TelegramBot_Agents } from './TelegramBot_Agents';
 //import { BaseAgent, RAGAgent, ToolAgent, ConversationAgent } from './agents';
 import { RAGAgent } from './agents';
 import { MessageContent, MessageContentComplex } from '@langchain/core/messages';
+import { InputFile } from 'telegraf/typings/core/types/typegram';
 import { ContextAdapter, } from './ContextAdapter';
+import { MenuManager, } from './MenuManager';
 import { CacheKeys } from './utils/cache';
 import { cleanModelResponse, CleanedResponse, hasThinkTags, messageContentToString } from './utils/utils';
 import { invokeModelWithFallback } from './utils/modelUtility';
@@ -62,6 +65,7 @@ import {
     AskTheAudienceResult,
     GameResponse,
     LifelineResult,
+    PatternContextData,
     PatternData  // Add this import
 } from './commands/types';
 
@@ -86,6 +90,7 @@ interface ConversationManagerParams {
     toolAgentSystemPrompt?: string;
     promptManager: PromptManager;
     agentManager: AgentManager,
+    menuManager: MenuManager;
     flowId: string,
     flowIdMap: Map<string, string>;
     databaseService?: DatabaseService; // Add this line
@@ -106,6 +111,7 @@ interface IMessage {
 }
 
 export class ConversationManager {
+    private bot: Telegraf<Context>;
     private retriever: BaseRetriever;
     public chatModel: BaseChatModel;
     public SpModel: BaseChatModel;
@@ -130,13 +136,14 @@ export class ConversationManager {
     private commands: Command[];
     private searchResultsCache: NodeCache;
     private promptManager: PromptManager;
+    public menuManager: MenuManager | null;
     private agentManager: AgentManager;
     private ragAgent: RAGAgent;
     private conversationTypeHistory: Map<string, string[]> = new Map();
     private readonly RAG_PROMPT_THRESHOLD = 3;
     private groupMembers: Map<number, Map<number, { is_bot: boolean, is_admin: boolean, username?: string, first_name?: string }>> = new Map();
     public cache: NodeCache;
-    private flowId: string;
+    public flowId: string;
     private readonly flowIdMap: Map<string, string>;
     public databaseService: DatabaseService | null = null; // Add this line
     private telegramBot: TelegramBot_Agents | null = null;
@@ -172,7 +179,7 @@ export class ConversationManager {
         this.welcomeMessage = params.welcomeMessage;
         this.adminIds = params.adminIds;
         this.promptManager = params.promptManager;
-        this.cache = new NodeCache({ stdTTL: 115, checkperiod: 116 }); // Cache for 2 minutes
+        this.cache = new NodeCache({ stdTTL: 900, checkperiod: 300 }); // Cache for 15 minutes        
         this.flowId = params.flowId;
         this.flowIdMap = params.flowIdMap;
         this.thinkingManager = new ThinkingManager(this.flowId);
@@ -185,7 +192,10 @@ export class ConversationManager {
         if (!this.promptManager) {
             throw new Error('PromptManager must be provided to ConversationManager');
         }
-
+        this.menuManager = params.menuManager;
+        if (!this.menuManager) {
+            console.warn('MenuManager is not provided to ConversationManager. Pattern menu functionality will be limited.');
+        }
         // Validate PromptManager has required prompts
         this.validatePromptManager();
 
@@ -627,17 +637,7 @@ export class ConversationManager {
             console.warn('Memory is not initialized. Unable to clear all memory.');
         }
     }
-    public storeSearchResults(searchId: string, results: any[]): void {
-        this.searchResultsCache.set(searchId, results);
-    }
-
-    public getSearchResult(searchId: string, index: number): any | null {
-        const results = this.searchResultsCache.get<any[]>(searchId);
-        if (results && index >= 0 && index < results.length) {
-            return results[index];
-        }
-        return null;
-    }
+    
 
     isAdmin(userId: string | number): boolean {
         const userIdNum = typeof userId === 'string' ? parseInt(userId, 10) : userId;
@@ -804,6 +804,7 @@ export class ConversationManager {
             console.log(`[${methodName}] Interaction type: ${interactionType}, Context requirement: ${contextRequirement}, Is RAG query: ${contextRequirement === 'rag'}`);
             console.log(`[${methodName}] Detected context requirement: ${contextRequirement}`);
             // Check if we should suggest a pattern
+            // Check if we should suggest a pattern
             if (!disablePatternSuggestion && adapter.isTelegramMessage() && await this.shouldSuggestPattern(userInput, interactionType, adapter.getMessageContext())) {
                 console.log(`[${methodName}] isTelegramMessage about to determine shouldSuggestPattern`);
                 try {
@@ -824,26 +825,32 @@ export class ConversationManager {
                         throw new Error('No pattern suggestion available');
                     }
 
-                    // Store comprehensive context
-                    const contextData = {
+                    // Convert messageId to number if it's a string
+                    const originalMessageId = typeof context.messageId === 'string'
+                        ? parseInt(context.messageId, 10)
+                        : context.messageId;
+
+                    const contextData: PatternContextData = {
                         input: userInput,
                         interactionType,
                         contextRequirement,
                         timestamp: Date.now(),
                         chatHistory: chatHistory.slice(-5),
-                        processed: false, // Initialize as not processed
-                        processedContent: undefined, // No processed content yet
-                        originalMessageId: context.messageId, // Store the original message ID
+                        originalMessageId: originalMessageId, // Now this will be a number or undefined
+                        currentPatternState: '', // Add this required property with an empty string as default
+                        processed: false,
+                        processedContent: undefined,
                         metadata: {
                             isReply,
                             replyToMessage,
                             userId,
-                            messageId: context.messageId,
+                            messageId: context.messageId, // This can remain as string | number in metadata
                             hasFile,
                             fileType: this.getFileTypeFromContext(context),
-                            suggestion: suggestion // Store the suggestion in metadata
+                            suggestion: suggestion
                         }
                     };
+
                     // delete old cache
                     const cachedData = this.cache.get(`pattern_context:${userId}`);
                     if (cachedData) {
@@ -879,10 +886,11 @@ export class ConversationManager {
                             currentPatternState: {}
                         };
                         patternData.originalInput = userInput;
-                        this.cache.set(cacheKey, patternData, 7200);
+                        this.cache.set(cacheKey, patternData, 14400); // 4 hours
 
                         console.log(`[${methodName}] Directly stored input for user ${userId}, length: ${userInput.length}`);
                     }
+
                     // Verify it was stored properly
                     const storedData = this.cache.get(`pattern_context:${userId}`);
                     console.warn(`[generateResponse] Pattern context storage check:`, {
@@ -898,54 +906,30 @@ export class ConversationManager {
                         wasStored: !!patternData,
                         inputLength: patternData?.originalInput?.length
                     });
-                    // Create keyboard
-                    // Create keyboard with both suggested and standard patterns
-                    const standardPatterns = [
-                        { name: 'summarize', emoji: '📝' },
-                        { name: 'improve_writing', emoji: '✍️' },
-                        { name: 'extract_wisdom', emoji: '💡' },
-                        { name: 'write_essay', emoji: '📚' }
-                    ];
 
-                    const keyboard = Markup.inlineKeyboard([
-                        // Main suggestion
-                        [Markup.button.callback(`✨ Use ${suggestion.pattern}`, `pattern_use:${suggestion.pattern}`)],
+                    // Use MenuManager to create the pattern menu
+                    if (!this.menuManager) {
+                        throw new Error('MenuManager is not available');
+                    }
 
-                        // Alternative patterns if available
-                        ...(suggestion.alternativePatterns?.length ? [
-                            suggestion.alternativePatterns.slice(0, 2).map(p =>
-                                Markup.button.callback(`🔄 Try ${p}`, `pattern_use:${p}`)
-                            )
-                        ] : []),
-
-                        // Standard patterns - two per row
-                        [
-                            Markup.button.callback(`${standardPatterns[0].emoji} Summarize`, `pattern_use:${standardPatterns[0].name}`),
-                            Markup.button.callback(`${standardPatterns[1].emoji} Improve`, `pattern_use:${standardPatterns[1].name}`)
-                        ],
-                        [
-                            Markup.button.callback(`${standardPatterns[2].emoji} Extract Wisdom`, `pattern_use:${standardPatterns[2].name}`),
-                            Markup.button.callback(`${standardPatterns[3].emoji} Write Essay`, `pattern_use:${standardPatterns[3].name}`)
-                        ],
-
-                        // Navigation buttons
-                        [
-                            Markup.button.callback('📋 More Patterns', 'pattern_more'),
-                            Markup.button.callback('🔧 Advanced Options', 'pattern_advanced'),
-                            Markup.button.callback('⏭️ Process Normally', 'pattern_skip')
-                        ]
-                    ]).reply_markup;
+                    // Create keyboard with MenuManager
+                    const keyboard = this.menuManager.createPatternSelectionMenu(
+                        suggestion,
+                        suggestion.alternativePatterns
+                    ).reply_markup;
 
                     // Store the keyboard in the context for handleEnhancedResponse to use
                     this.cache.set(
                         `pattern_keyboard:${userId}`,
                         keyboard,
-                        7200
+                        14400  // 4 hours
                     );
+
                     if (suggestion.result) {
                         console.log(`[getPatternSuggestions] Pattern ${suggestion.pattern} was processed immediately, returning result`);
                         return [suggestion.result];
                     }
+
                     // Return just the message array
                     return [
                         `📝 I notice this content might benefit from specialized processing:\n\n` +
@@ -954,8 +938,6 @@ export class ConversationManager {
                         `*Confidence:* ${Math.round(suggestion.confidence * 100)}%\n\n` +
                         `*Description:* ${suggestion.description}\n\n` +
                         (suggestion.reasoning ? `*Reasoning:* ${suggestion.reasoning}\n\n` : '')
-
-
                     ];
 
                 } catch (error) {
@@ -985,7 +967,7 @@ export class ConversationManager {
             let context = "";
 
             if (isRAGQuery && !gameState?.isActive) {
-                this.ragQuestionCount++;
+                // this.ragQuestionCount++;
                 standaloneQuestion = await this.getStandaloneQuestion(userInput, truncatedHistory, interactionType, adapter);
                 context = await this.getDynamicContext(standaloneQuestion, truncatedHistory, interactionType, userId, adapter, replyToMessage, progressKey);
                 console.log(`[${methodName}] Standalone question: ${standaloneQuestion}`);
@@ -1005,13 +987,15 @@ export class ConversationManager {
                             console.warn(`[${methodName}] Response does not include context, attempting to regenerate`);
                             response = await this.regenerateWithExplicitContext(standaloneQuestion, context, truncatedHistory, prompt, interactionType);
                         }
-                        if (this.ragQuestionCount % 3 === 0) {
+                        /*
+                        if (this.ragQuestionCount % 6 === 0) {
                             const followUpQuestions = await this.generateFollowUpQuestions(context, truncatedHistory);
                             if (followUpQuestions.length > 0) {
                                 response += "\n\n🤔 Here are some follow-up questions you might find interesting:\n" +
                                     followUpQuestions.map(q => `• ${q}`).join('\n');
                             }
                         }
+                            */
                         break;
                     case 'chat':
                         response = await this.generateAnswer(userInput, "", truncatedHistory, interactionType, userId, adapter, replyToMessage, undefined, progressKey, thinkingPreferences);
@@ -1247,11 +1231,25 @@ export class ConversationManager {
         console.log('PromptManager state:', this.promptManager ? 'Initialized' : 'Not initialized');
         const isRAGEnabled = this.agentManager.isRAGModeEnabled(userId);
         const contextRequirement: ContextRequirement = context ? 'rag' : 'chat';
+        if (context) {
+            // Log that we're using this context
+            console.log(`[${methodName}] Context will be used for response generation (${context.length} chars)`);
+
+            // Explicitly save this context again with the user ID
+            const contextCacheKey = `relevant_context:${userId}`;
+            this.cache.set(contextCacheKey, {
+                relevantContext: context,
+                timestamp: Date.now()
+            }, 3600); // 1 hour
+        } else {
+            console.warn(`[${methodName}] No context available for this response generation`);
+        }
 
         try {
             if (progressKey && adapter) {
                 console.log(`[${methodName}:${this.flowId}] Updating progress: Preparing response`);
                 await this.updateProgress(adapter, progressKey, "🧠 Preparing the response...");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
             let systemPrompt = this.promptManager.constructSystemPrompt(interactionType, contextRequirement);
             const recentContextSummary = this.promptManager.generateRecentContextSummary(chatHistory);
@@ -1262,10 +1260,11 @@ export class ConversationManager {
             // Try to get the contextualized query from cache
             let contextualizedQuery: string | undefined = this.cache.get<string>(queryCacheKey);
 
+
             if (!contextualizedQuery) {
                 // If not in cache, generate it and store in cache
                 contextualizedQuery = await this.constructContextualizedQuery(question, chatHistory, interactionType, adapter, replyToMessage);
-                this.cache.set(queryCacheKey, contextualizedQuery);
+                this.cache.set(queryCacheKey, contextualizedQuery, 1800);
                 console.log(`[${methodName}] Stored contextualizedQuery in cache with key: "${queryCacheKey}".`);
             } else {
                 console.log(`[${methodName}] Retrieved contextualizedQuery from cache with key: "${queryCacheKey}".`);
@@ -1277,6 +1276,7 @@ export class ConversationManager {
             if (progressKey && adapter) {
                 console.log(`[${methodName}:${this.flowId}] Updating progress: Preparing response`);
                 await this.updateProgress(adapter, progressKey, "📚");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
             const userMessage = new HumanMessage(
                 this.promptManager.constructUserPrompt(contextualizedQuery, context, interactionType)
@@ -1341,6 +1341,7 @@ export class ConversationManager {
                 if (progressKey && adapter) {
                     console.log(`[${methodName}:${this.flowId}] Updating progress: Applying post processing`);
                     await this.updateProgress(adapter, progressKey, "🧐 Applying post processing...✈️");
+                    console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
                 }
                 content = await this.postProcessResponse(content, question, interactionType);
             }
@@ -1355,6 +1356,7 @@ export class ConversationManager {
             if (progressKey && adapter) {
                 console.log(`[${methodName}:${this.flowId}] Updating progress: Response ready`);
                 await this.updateProgress(adapter, progressKey, "💯");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
 
             // Now that all processing is complete, display thinking if we have any
@@ -1672,7 +1674,7 @@ export class ConversationManager {
         const isRagModeEnabled = this.agentManager.isRAGModeEnabled(userId);
         return isRagModeEnabled ? 'rag' : baseType;
     }
-    private async detectContextRequirement(
+    public async detectContextRequirement(
         userInput: string,
         baseType: InteractionType,
         userId: string
@@ -1999,6 +2001,7 @@ export class ConversationManager {
         try {
             if (progressKey && adapter) {
                 await this.updateProgress(adapter, progressKey, "🔄 Regenerating response with explicit context...");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
 
             // More structured prompt template
@@ -2035,6 +2038,8 @@ export class ConversationManager {
 
             if (progressKey && adapter) {
                 await this.updateProgress(adapter, progressKey, "✍️ Crafting new response...");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
+
             }
 
             // Use summationModel first as it might be more careful with context
@@ -2067,6 +2072,7 @@ export class ConversationManager {
                 console.warn(`[${methodName}] Regenerated response still doesn't use context properly`);
                 if (progressKey && adapter) {
                     await this.updateProgress(adapter, progressKey, "⚠️ Unable to generate context-based response");
+                    console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
                 }
 
                 // Last resort: Generate a response that explicitly quotes the context
@@ -2075,6 +2081,7 @@ export class ConversationManager {
 
             if (progressKey && adapter) {
                 await this.updateProgress(adapter, progressKey, "✅ Successfully regenerated response");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
 
             return content;
@@ -2084,6 +2091,7 @@ export class ConversationManager {
 
             if (progressKey && adapter) {
                 await this.updateProgress(adapter, progressKey, "❌ Error regenerating response");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
 
             // Return a safe fallback response
@@ -2292,9 +2300,9 @@ export class ConversationManager {
         });
 
         const response: AIMessage = await invokeModelWithFallback(
-            this.summationModel,
-            this.chatModel,
             this.utilityModel,
+            this.chatModel,
+            this.summationModel,
             formattedPrompt,
             { initialTimeout: 30000, maxTimeout: 120000, retries: 2 }
         );
@@ -2490,11 +2498,15 @@ export class ConversationManager {
         let contextualizedQuery: string | undefined = this.cache.get<string>(queryCacheKey);
 
         const currentTime = Date.now();
-        const cacheDuration = 2 * 60 * 1000; // 2 minutes in milliseconds
+        const cacheDuration = 60 * 60 * 1000; // 60 minutes in milliseconds
 
         // Check if relevantContext is in cache and valid
-        if (contextCacheEntry && (currentTime - contextCacheEntry.timestamp) < cacheDuration) {
+        if (contextCacheEntry) {
+            // Log age for debugging
             console.log(`[${methodName}] Cache hit for relevant context. Age: ${(currentTime - contextCacheEntry.timestamp) / 1000} seconds`);
+
+            // Important: Don't apply timing logic here - if we have the entry, use it
+            // The NodeCache TTL system will automatically handle expiration
             relevantContext = contextCacheEntry.relevantContext;
         } else {
             console.log(`[${methodName}] Cache miss or expired for relevant context. Computing new context.`);
@@ -2503,7 +2515,7 @@ export class ConversationManager {
             if (!contextualizedQuery) {
                 console.log(`[${methodName}] Constructing new contextualized query.`);
                 contextualizedQuery = await this.constructContextualizedQuery(question, chatHistory, interactionType, adapter, replyToMessage, progressKey,);
-                this.cache.set(queryCacheKey, contextualizedQuery);
+                this.cache.set(queryCacheKey, contextualizedQuery, cacheDuration);
                 console.log(`[${methodName}] New contextualized query stored in cache.`);
             } else {
                 console.log(`[${methodName}] Using cached contextualized query.`);
@@ -2523,7 +2535,7 @@ export class ConversationManager {
             if (docs.length === 0) {
                 console.log(`[${methodName}] No documents retrieved. Returning empty context.`);
                 relevantContext = "";
-                this.cache.set(contextCacheKey, { relevantContext, timestamp: currentTime });
+                this.cache.set(contextCacheKey, { relevantContext, timestamp: currentTime }, 1800);
                 return relevantContext;
             }
 
@@ -2544,7 +2556,7 @@ export class ConversationManager {
             if (topDocs.length === 0) {
                 console.log(`[${methodName}] No documents met the relevance threshold. Returning empty context.`);
                 relevantContext = "";
-                this.cache.set(contextCacheKey, { relevantContext, timestamp: currentTime });
+                this.cache.set(contextCacheKey, { relevantContext, timestamp: currentTime }, 1800);
                 return relevantContext;
             }
 
@@ -2554,7 +2566,7 @@ export class ConversationManager {
             })));
 
             relevantContext = this.formatRelevantContext(topDocs);
-            this.cache.set(contextCacheKey, { relevantContext, timestamp: currentTime });
+            this.cache.set(contextCacheKey, { relevantContext, timestamp: currentTime }, 1800);
             console.log(`[${methodName}] New relevant context stored in cache.`);
         }
 
@@ -2570,24 +2582,33 @@ export class ConversationManager {
      * @param topDocs An array of top-scoring documents with their content, score, and metadata
      * @returns A formatted string containing the most relevant context
      */
+    // In formatRelevantContext method in ConversationManager.ts
     private formatRelevantContext(topDocs: ScoredDocument[]): string {
-        // console.log("[formatRelevantContext] Received topDocs:", JSON.stringify(topDocs, null, 2));
         if (topDocs.length === 0) {
             return "No relevant context found.";
         }
+
+        // Format the context for our response generation pipeline
         const formattedContext = topDocs
             .filter(doc => doc.score > 0)
             .sort((a, b) => b.score - a.score)
             .slice(0, 8)
             .map(doc => {
-                const formattedDoc = `[Relevance: ${doc.score.toFixed(3)}]\n${doc.content}\n--- Metadata: ${JSON.stringify(doc.metadata)}`;
-                // console.log("[formatRelevantContext] Formatted document:", formattedDoc);
-                return formattedDoc;
+                // The critical part - maintain the [Relevance:X.XXX] prefix format
+                return `[Relevance: ${doc.score.toFixed(3)}]\n${doc.content}\n--- Metadata: ${JSON.stringify(doc.metadata)}`;
             })
             .join("\n\n");
-        //console.log("[formatRelevantContext] Final formatted context:", formattedContext);
+
+        // Store the raw documents separately for citation generation
+        // This is the new part
+        this.cache.set(`raw_docs:${this.flowId}`, {
+            documents: topDocs,
+            timestamp: Date.now()
+        }, 3600); // 1 hour TTL
+
         return formattedContext;
     }
+
 
     public async constructContextualizedQuery(
         question: string,
@@ -2604,6 +2625,7 @@ export class ConversationManager {
         if (progressKey && adapter) {
             console.log(`[${methodName}:${this.flowId}] Updating progress: constructContextualizedQuery`);
             await this.updateProgress(adapter, progressKey, "📜 Constructing and contextualizing the query...");
+            console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
         }
         let contextualizedQuery = question;
         let contextParts: string[] = [];
@@ -2849,6 +2871,7 @@ export class ConversationManager {
                 console.log(`[${methodName}] Failed to get valid rating after retry. Using fallback.`);
                 if (progressKey && adapter) {
                     await this.updateProgress(adapter, progressKey, "⁉️ Failed to get valid rating after retry. Using fallback.");
+                    console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
                 }
                 return this.fallbackContextCheck(response, context);
             }
@@ -2856,6 +2879,7 @@ export class ConversationManager {
             console.log(`[${methodName}] Final rating: ${rating}/5`);
             if (progressKey && adapter) {
                 await this.updateProgress(adapter, progressKey, `🎯 Context relevance rating: ${rating}/5`);
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
             return rating >= 3;
 
@@ -3434,7 +3458,7 @@ export class ConversationManager {
         return questions[level % questions.length];
     }
 
-    private async shouldSuggestPattern(
+    public async shouldSuggestPattern(
         input: string,
         interactionType: InteractionType,
         context: MessageContext
@@ -3454,15 +3478,12 @@ export class ConversationManager {
         const isLongText = input.length > 500;
         const hasCodeBlocks = input.includes('```');
         const hasUrls = /https?:\/\/[^\s]+/.test(input);
-        const isComplexQuestion = input.split(' ').length > 15 && input.includes('?');
 
         return (
             hasFile ||
             isLongText ||
             hasCodeBlocks ||
-            (hasUrls && input.length > 200) ||
-            isComplexQuestion ||
-            interactionType === 'explanatory_question'
+            (hasUrls && input.length > 200)
         );
     }
 
@@ -3537,8 +3558,43 @@ export class ConversationManager {
         return undefined;
     }
 
+    /**
+ * Stores input data for pattern processing
+ * @param userId The user ID
+ * @param input The input to store
+ */
     private storePatternInput(userId: string, input: string): void {
-        // Get existing pattern data or create new
+        // First, check if this is a pattern suggestion message
+        const isPatternSuggestion = input.includes('📝 I notice this content might benefit from specialized processing') ||
+            input.includes('Suggested Pattern:');
+
+        if (isPatternSuggestion) {
+            console.warn(`[storePatternInput] Attempted to store a pattern suggestion message as original input for user ${userId}`);
+
+            // Check if we already have original input that's not a suggestion
+            const cacheKey = `pattern_data:${userId}`;
+            const existingData = this.cache.get<PatternData>(cacheKey);
+
+            if (existingData?.originalInput &&
+                !existingData.originalInput.includes('📝 I notice this content') &&
+                !existingData.originalInput.includes('Suggested Pattern:')) {
+
+                console.log(`[storePatternInput] Keeping existing original input (${existingData.originalInput.length} chars)`);
+                return; // Keep the existing original input
+            }
+
+            // If we don't have valid original input, check recent history
+            console.log(`[storePatternInput] Searching for real original content...`);
+
+            // Store the suggestion separately for reference
+            this.cache.set(`pattern_suggestion:${userId}`, input, 3600);
+
+            // Don't store the suggestion as originalInput
+            // We'll handle fallback in pattern processing methods
+            return;
+        }
+
+        // Regular case - not a pattern suggestion
         const cacheKey = `pattern_data:${userId}`;
         let patternData = this.cache.get<PatternData>(cacheKey) || {
             originalInput: input,
@@ -3550,11 +3606,98 @@ export class ConversationManager {
         patternData.originalInput = input;
 
         // Store with extended TTL for large content
-        this.cache.set(cacheKey, patternData, 3600);  // 1 hour
+        this.cache.set(cacheKey, patternData, 3600); // 1 hour
 
         console.log(`[storePatternInput] Stored input for user ${userId}, length: ${input.length}`);
     }
+    public async sendDocument(
+        chatId: number | string,
+        document: string | { source: string | Buffer },
+        options: any = {}
+    ): Promise<any> {
+        console.log(`Entering sendDocument`);
 
-    
+        try {
+            // Handle different document formats
+            let documentToSend: string | InputFile;
+
+            if (typeof document === 'string') {
+                // If it's a string, use it directly
+                documentToSend = document;
+            } else if (document && typeof document === 'object' && 'source' in document) {
+                // If it has a source property
+                if (typeof document.source === 'string') {
+                    // String source - use as path
+                    documentToSend = document.source;
+                } else if (Buffer.isBuffer(document.source)) {
+                    // Buffer source - create input file with buffer
+                    documentToSend = { source: document.source };
+                } else {
+                    // Fallback
+                    throw new Error('Invalid document source format');
+                }
+            } else {
+                throw new Error('Invalid document format');
+            }
+
+            // Call the Telegram API with the correctly formatted document
+            return await this.bot!.telegram.sendDocument(chatId, documentToSend, options);
+        } catch (error) {
+            console.error(`Error in sendDocument:`, error);
+            throw error;
+        }
+    }
+
+    /**
+    * Updates the interaction type and context requirement based on question analysis
+    * @param questionAnalysis The question analysis result
+    * @param baseInteractionType The initial interaction type
+    * @param baseContextRequirement The initial context requirement
+    * @returns Updated interaction details
+    */
+    public updateInteractionFromQuestionAnalysis(
+        questionAnalysis: QuestionAnalysisResult,
+        baseInteractionType: InteractionType,
+        baseContextRequirement: ContextRequirement
+    ): { interactionType: InteractionType, contextRequirement: ContextRequirement } {
+        const methodName = 'updateInteractionFromQuestionAnalysis';
+
+        // If it's not confidently a question, don't modify
+        if (!questionAnalysis.isQuestion || questionAnalysis.confidence < 0.7) {
+            return { interactionType: baseInteractionType, contextRequirement: baseContextRequirement };
+        }
+
+        // Determine the appropriate interaction type based on analysis
+        let interactionType: InteractionType = baseInteractionType;
+        let contextRequirement: ContextRequirement = baseContextRequirement;
+
+        // Update interaction type
+        if (questionAnalysis.knowledgeRequired === 'specific') {
+            interactionType = 'explanatory_question';
+        } else if (questionAnalysis.knowledgeRequired === 'general') {
+            interactionType = 'factual_question';
+        } else {
+            interactionType = 'general_question';
+        }
+
+        // Update context requirement
+        if (questionAnalysis.requiresRagMode) {
+            contextRequirement = 'rag';
+        } else if (questionAnalysis.knowledgeRequired === 'specific') {
+            contextRequirement = 'rag';
+        } else {
+            contextRequirement = 'chat';
+        }
+
+        logInfo(methodName, 'Updated interaction details based on question analysis', {
+            originalInteraction: baseInteractionType,
+            originalContext: baseContextRequirement,
+            newInteraction: interactionType,
+            newContext: contextRequirement,
+            reasoning: questionAnalysis.reasoning
+        });
+
+        return { interactionType, contextRequirement };
+    }
 }
 //export const splitAndTruncateMessage = ConversationManager.splitAndTruncateMessage;

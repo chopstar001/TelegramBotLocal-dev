@@ -10,6 +10,8 @@ import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from '@langchain/
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ThinkingManager } from '../ThinkingManager';
+import { invokeModelWithFallback } from '../utils/modelUtility';
+
 
 interface PatternSuggestion {
     pattern: string;
@@ -102,12 +104,57 @@ export class PatternPromptAgent extends BaseAgent {
         messages.push(new HumanMessage(input));
 
         try {
-            const response = await this.conversationManager.SpModel.invoke(messages);
-            return this.cleanThinkTags(response.content);
+            const response: AIMessage = await invokeModelWithFallback(
+                this.conversationManager.SpModel,
+                this.conversationManager.chatModel,
+                this.conversationManager.summationModel,
+                messages,
+                { initialTimeout: 60000, maxTimeout: 120000, retries: 2 }
+            );
+    
+            const contentWithoutThinkTags = this.thinkingManager!.cleanThinkTags(response.content) as string;
+
+            // Then clean HTML to make it Telegram-compatible
+            return this.cleanHTMLForTelegram(contentWithoutThinkTags);
         } catch (error) {
             console.error('Error processing pattern:', error);
             throw error;
         }
+    }
+
+    /**
+     * Converts HTML to a format Telegram can understand (for safe display)
+     */
+    private cleanHTMLForTelegram(html: string): string {
+        if (typeof html !== 'string') {
+            return String(html);
+        }
+
+        // Replace paragraph tags with newlines
+        let result = html.replace(/<\/?p>/g, '\n');
+
+        // Replace lists with simple formatting
+        result = result.replace(/<ul>([\s\S]*?)<\/ul>/g, (match, content) => {
+            return content.replace(/<li>([\s\S]*?)<\/li>/g, '• $1\n');
+        });
+
+        result = result.replace(/<ol>([\s\S]*?)<\/ol>/g, (match, content) => {
+            let index = 1;
+            return content.replace(/<li>([\s\S]*?)<\/li>/g, () => {
+                return `${index++}. $1\n`;
+            });
+        });
+
+        // Preserve basic formatting that Telegram supports
+        // Telegram supports <b>, <i>, <u>, <s>, <a>, <code>, <pre>
+
+        // Remove any other HTML tags
+        result = result.replace(/<(?!\/?(b|i|u|s|a|code|pre))[^>]*>/g, '');
+
+        // Clean up excessive newlines
+        result = result.replace(/\n{3,}/g, '\n\n');
+
+        return result.trim();
     }
     public async processQuery(
         input: string,
@@ -143,8 +190,16 @@ export class PatternPromptAgent extends BaseAgent {
 
         messages.push(new HumanMessage(input));
 
-        const response = await this.conversationManager.SpModel.invoke(messages);
-        const content = this.cleanThinkTags(response.content);
+        const response: AIMessage = await invokeModelWithFallback(
+            this.conversationManager.SpModel,
+            this.conversationManager.chatModel,
+            this.conversationManager.summationModel,
+            messages,
+            { initialTimeout: 60000, maxTimeout: 120000, retries: 2 }
+        );
+
+        const content = this.thinkingManager!.cleanThinkTags(response.content) as string;
+
 
         return {
             response: [content],
@@ -257,29 +312,39 @@ export class PatternPromptAgent extends BaseAgent {
         if (explicitPattern) {
             console.log(`[suggestPattern] Detected explicit pattern request: ${explicitPattern}`);
             const pattern = this.patterns.get(explicitPattern);
-            
+
             // If the explicitly requested pattern exists, process it immediately
             if (pattern) {
                 try {
+                    if (!this.conversationManager) {
+                        throw new Error('ConversationManager not initialized');
+                    }
                     console.log(`[suggestPattern] Immediately processing with pattern: ${explicitPattern}`);
-                    
+
                     // Create messages for the model
                     const messages = [
                         new SystemMessage(pattern.systemPrompt)
                     ];
-    
+
                     if (pattern.userPrompt) {
                         messages.push(new HumanMessage(pattern.userPrompt));
                     }
-    
+
                     // Extract any content after the pattern request
                     const contentAfterPattern = this.extractContentAfterPattern(input, explicitPattern);
                     messages.push(new HumanMessage(contentAfterPattern || input));
-    
+
                     // Process with SP model
-                    const response = await this.conversationManager!.SpModel.invoke(messages);
-                    const result = this.cleanThinkTags(response.content);
-    
+                    const response: AIMessage = await invokeModelWithFallback(
+                        this.conversationManager.SpModel,
+                        this.conversationManager.chatModel,
+                        this.conversationManager.summationModel,
+                        messages,
+                        { initialTimeout: 60000, maxTimeout: 120000, retries: 2 }
+                    );
+            
+                    const result = this.thinkingManager!.cleanThinkTags(response.content) as string;
+
                     return {
                         pattern: explicitPattern,
                         description: pattern.description,
@@ -289,7 +354,7 @@ export class PatternPromptAgent extends BaseAgent {
                         alternativePatterns: [],
                         keyboard: null, // No keyboard needed since we've already processed
                         result: result, // Include the processed result
-                       
+
                     };
                 } catch (error) {
                     console.error(`[suggestPattern] Error processing explicit pattern:`, error);
@@ -297,20 +362,20 @@ export class PatternPromptAgent extends BaseAgent {
                 }
             }
         }
-    
+
         // If no explicit pattern request, requested pattern not found, or error in processing,
         // proceed with normal analysis
         const analysis = await this.analyzeInput(input);
         const suggestion = await this.reasonAboutPattern(input, analysis, interactionType, explicitPattern);
-    
+
         if (!suggestion) return null;
-    
+
         const pattern = this.patterns.get(suggestion.pattern);
         if (!pattern) {
             console.warn(`Suggested pattern ${suggestion.pattern} not found`);
             return null;
         }
-    
+
         return {
             pattern: suggestion.pattern,
             description: pattern.description,
@@ -326,34 +391,34 @@ export class PatternPromptAgent extends BaseAgent {
             })
         };
     }
-    
+
     // Helper method to extract content after a pattern request
     private extractContentAfterPattern(input: string, patternName: string): string | null {
         // Convert pattern name underscores to spaces for matching
         const patternNameSpaced = patternName.replace(/_/g, ' ');
-        
+
         // Try different regex patterns to extract content
         const patterns = [
             // For direct pattern name commands like "extract_wisdom: content"
             new RegExp(`${patternName}\\s*[:;-]\\s*(.+)`, 's'),
-            
+
             // For spaced pattern name commands like "extract wisdom: content"
             new RegExp(`${patternNameSpaced}\\s*[:;-]\\s*(.+)`, 's'),
-            
+
             // For "please summarize this" type patterns
             new RegExp(`(please|can you)\\s+${patternNameSpaced}\\s+(?:this|the following|these)\\s*[:;.-]?\\s*(.+)`, 's'),
-            
+
             // For "I need a summary of" type patterns
             new RegExp(`I\\s+need\\s+a\\s+${patternNameSpaced}\\s+of\\s*[:;.-]?\\s*(.+)`, 's')
         ];
-        
+
         for (const regex of patterns) {
             const match = input.match(regex);
             if (match && match[1]) {
                 return match[1].trim();
             }
         }
-        
+
         // If we can't clearly extract the content, return null to use the full input
         return null;
     }
@@ -362,52 +427,52 @@ export class PatternPromptAgent extends BaseAgent {
     private detectExplicitPatternRequest(input: string): string | null {
         // Normalize input for pattern matching
         const normalizedInput = input.toLowerCase().trim();
-        
+
         // Direct pattern name detection with more flexible matching
         const patternNames = Array.from(this.patterns.keys());
         for (const patternName of patternNames) {
             // Check for direct mentions of the pattern name
-            if (normalizedInput.includes(`use ${patternName}`) || 
+            if (normalizedInput.includes(`use ${patternName}`) ||
                 normalizedInput.includes(`using ${patternName}`) ||
                 normalizedInput.includes(`with ${patternName}`)) {
                 return patternName;
             }
-            
+
             // Check for pattern name at the start
             if (normalizedInput.startsWith(patternName)) {
                 return patternName;
             }
-            
+
             // Look for pattern name as a command
             if (normalizedInput.match(new RegExp(`^${patternName}\\s+this`, 'i'))) {
                 return patternName;
             }
         }
-        
+
         // More flexible pattern mappings - don't require exact phrasing at the start
         const patternMappings = [
             // Summarization patterns
             { phrases: ['summarize', 'summary', 'summarization', 'tldr', 'summary of'], pattern: 'summarize' },
-            
+
             // Extraction patterns
             { phrases: ['extract wisdom', 'extract insights', 'extract key points', 'wisdom from'], pattern: 'extract_wisdom' },
             { phrases: ['extract main idea', 'core message', 'main point'], pattern: 'extract_main_idea' },
             { phrases: ['extract recommendations', 'recommendations from', 'what should i do'], pattern: 'extract_recommendations' },
-            
+
             // Analysis patterns
             { phrases: ['analyze paper', 'paper analysis', 'analyze this paper', 'analyze article'], pattern: 'analyze_paper' },
             { phrases: ['analyze code', 'code analysis', 'review code'], pattern: 'explain_code' },
-            
+
             // Writing patterns
             { phrases: ['improve writing', 'enhance writing', 'edit text', 'make this better'], pattern: 'improve_writing' },
             { phrases: ['write essay', 'create essay', 'essay about'], pattern: 'write_essay' },
             { phrases: ['write latex', 'latex format', 'in latex'], pattern: 'write_latex' },
-            
+
             // Explanation patterns
             { phrases: ['explain code', 'code explanation', 'how does this code work'], pattern: 'explain_code' },
             { phrases: ['explain math', 'math explanation', 'explain this formula'], pattern: 'explain_math' },
         ];
-        
+
         // Check for phrases anywhere in the first 100 characters (not just at the beginning)
         const inputStart = normalizedInput.substring(0, 100);
         for (const mapping of patternMappings) {
@@ -417,7 +482,7 @@ export class PatternPromptAgent extends BaseAgent {
                 }
             }
         }
-        
+
         // Check for intent-based expressions
         const intentPhrases = [
             // Request-based intents with broader matching
@@ -425,30 +490,30 @@ export class PatternPromptAgent extends BaseAgent {
             { regex: /please .{0,20}(summarize|summary)/i, pattern: 'summarize' },
             { regex: /i need .{0,20}(a summary|summarize)/i, pattern: 'summarize' },
             { regex: /could you .{0,20}(summarize|summary)/i, pattern: 'summarize' },
-            
+
             // Extract intents
             { regex: /(extract|pull out|identify) .{0,20}(wisdom|insights|key points)/i, pattern: 'extract_wisdom' },
             { regex: /(extract|pull out|identify) .{0,20}(main idea|main point|core message)/i, pattern: 'extract_main_idea' },
-            
+
             // Analysis intents
             { regex: /(analyze|review|assess) .{0,20}(paper|article|document)/i, pattern: 'analyze_paper' },
             { regex: /(analyze|review|check) .{0,20}(code|program|script)/i, pattern: 'explain_code' },
-            
+
             // Writing intents
             { regex: /(improve|enhance|fix|edit) .{0,20}(writing|text|document)/i, pattern: 'improve_writing' },
             { regex: /(write|create) .{0,20}(essay|paper|article)/i, pattern: 'write_essay' },
-            
+
             // Explanation intents
             { regex: /(explain|describe|clarify) .{0,20}(code|program|script)/i, pattern: 'explain_code' },
             { regex: /(explain|describe|clarify) .{0,20}(math|formula|equation)/i, pattern: 'explain_math' },
         ];
-        
+
         for (const intent of intentPhrases) {
             if (intent.regex.test(inputStart)) {
                 return intent.pattern;
             }
         }
-        
+
         return null;
     }
     private async reasonAboutPattern(
@@ -521,13 +586,23 @@ export class PatternPromptAgent extends BaseAgent {
         }, null, 2);
 
         try {
+            if (!this.conversationManager) {
+                throw new Error('ConversationManager not initialized');
+            }
             const messages = [
                 new SystemMessage(systemPrompt),
                 new HumanMessage(humanMessage)
             ];
             // Use SP model for reasoning
-            const response = await this.conversationManager!.SpModel.invoke(messages);
-            const cleanedResponse = this.cleanThinkTags(response.content);
+            const response: AIMessage = await invokeModelWithFallback(
+                this.conversationManager.SpModel,
+                this.conversationManager.chatModel,
+                this.conversationManager.summationModel,
+                messages,
+                { initialTimeout: 60000, maxTimeout: 120000, retries: 2 }
+            );
+    
+            const cleanedResponse = this.thinkingManager!.cleanThinkTags(response.content) as string;
             const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
             if (!jsonMatch) {
                 throw new Error("JSON not found in response");
@@ -615,13 +690,23 @@ export class PatternPromptAgent extends BaseAgent {
     Provide analysis in JSON format with detailed reasoning for each characteristic.`;
 
         try {
+            if (!this.conversationManager) {
+                throw new Error('ConversationManager not initialized');
+            }
             const messages = [
                 new SystemMessage(systemPrompt),
                 new HumanMessage(input)
             ];
 
-            const response = await this.conversationManager!.SpModel.invoke(messages);
-            return JSON.parse(this.cleanThinkTags(response.content));
+            const response: AIMessage = await invokeModelWithFallback(
+                this.conversationManager.SpModel,
+                this.conversationManager.chatModel,
+                this.conversationManager.summationModel,
+                messages,
+                { initialTimeout: 60000, maxTimeout: 120000, retries: 2 }
+            );
+    
+            return JSON.parse(this.thinkingManager!.cleanThinkTags(response.content) as string);
 
         } catch (error) {
             console.error('Error analyzing input:', error);
@@ -678,7 +763,89 @@ export class PatternPromptAgent extends BaseAgent {
 
         return Markup.inlineKeyboard(buttons);
     }
+    // Add a pattern in PatternPromptAgent.ts
+    public async processForPDF(
+        patternName: string,
+        input: string,
+        adapter: ContextAdapter
+    ): Promise<string> {
+        // Create a specific system prompt for PDF-formatted content that preserves original message
+        const systemPrompt = `You are an expert document content analyst tasked with providing excellent structural formatting of any writing or body of text to PDF.
+        
+    IMPORTANT: Do NOT change the meaning, message, intent, or wording of the original content. Your task is ONLY to improve the structural formatting while preserving the exact language of the source material.
+    
+    Take a deep breath and think step by step about how to best accomplish this goal using the following steps. 
 
+    First, identify what type of content this is (transcript, article, notes, etc.) and then apply appropriate formatting:
+    
+    Guidelines:
+    - Preserve ALL original wording, terminology, and meaning
+    - Add organizational structure without changing content
+    - Structure the content logically into clear sections where appropriate
+    - Use # for main headings and ## for subheadings when needed for organization
+    - For content that represents lists, format with bullet points (- or •) or numbered lists (1., 2., etc.)
+    - Enclose direct quotes in "quotation marks"
+    - Ensure proper spacing between paragraphs and sections
+    - If needed, add simple informative headings that reflect the existing content (like "Introduction" or "Key Points")
+    - DO NOT add your own analysis, summaries, or change the language style
+    
+    Example of acceptable changes:
+    Original: "the main points were first that AI is changing rapidly second we need new regulations and third more research is needed"
+    
+    Formatted: 
+    ## Main Points
+    1. AI is changing rapidly
+    2. We need new regulations
+    3. More research is needed
+    
+    Remember: Your role is strictly to improve readability through formatting, NOT to rewrite or modify the substance of the content.`;
+    
+        // Get the response from LLM
+        const messages = [
+            new SystemMessage(systemPrompt),
+            new HumanMessage(input)
+        ];
+    
+        try {
+            if (!this.conversationManager) {
+                throw new Error('ConversationManager not initialized');
+            }
+            console.log(`[processForPDF] Processing content of length ${input.length} for pattern: ${patternName}`);
+            const response: AIMessage = await invokeModelWithFallback(
+                this.conversationManager.SpModel,
+                this.conversationManager.chatModel,
+                this.conversationManager.summationModel,
+                messages,
+                { initialTimeout: 60000, maxTimeout: 120000, retries: 2 }
+            );
+    
+            const contentWithoutThinkTags = this.thinkingManager!.cleanThinkTags(response.content) as string;
+            
+            console.log(`[processForPDF] Successfully formatted content for PDF, output length: ${contentWithoutThinkTags.length}`);
+            return contentWithoutThinkTags;
+        } catch (error) {
+            console.error(`[processForPDF] Error formatting content for PDF:`, error);
+            // In case of error, return the original content with minimal formatting
+            console.log(`[processForPDF] Falling back to original content with minimal formatting`);
+            return this.applyMinimalFormatting(input);
+        }
+    }
+    
+    // Fallback method to apply minimal formatting if the LLM call fails
+    private applyMinimalFormatting(input: string): string {
+        // Add a basic title if none exists
+        let formatted = input;
+        
+        // Check if the content already has headings
+        if (!formatted.includes('# ')) {
+            formatted = `# Document\n\n${formatted}`;
+        }
+        
+        // Ensure proper spacing between paragraphs
+        formatted = formatted.replace(/\n{3,}/g, '\n\n');
+        
+        return formatted;
+    }
 
     public getPatternsByCategory(category: string): Pattern[] {
         return Array.from(this.patterns.entries())
@@ -707,5 +874,6 @@ export class PatternPromptAgent extends BaseAgent {
     public async cleanup(): Promise<void> {
         // No cleanup necessary for PatternPromptAgent
     }
+
 
 }

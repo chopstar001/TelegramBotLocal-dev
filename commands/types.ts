@@ -143,6 +143,10 @@ export interface MessageContext {
         photo: { source: string | Buffer } | string,
         options?: PhotoMessageOptions
     ) => Promise<MessageResponse>;
+    replyWithDocument?: (
+        document: { source: string | Buffer } | string,
+        options?: any
+    ) => Promise<any>;
     callbackQuery?: {
         data: string;
         message?: {
@@ -706,12 +710,13 @@ export interface EnhancedResponse {
         gameState: any;
         keyboard: any;
     } | null;
-    patternMetadata?: {  // New field
+    patternMetadata?: {
         keyboard: any;
         pattern: string;
         description: string;
         confidence: number;
     } | null;
+    skipStandardMenu?: boolean; // New flag to control menu display
 }
 
 export interface GameState {
@@ -863,14 +868,14 @@ export interface BaseLifelineResult {
 
 /////////////////////////////////////END-GAME_STUFF's/////////////////////////////////////////////////
 
-// Add this to types.ts
+
 export interface PatternContextData {
     input: string;
     interactionType: InteractionType;
     contextRequirement: ContextRequirement;
     timestamp: number;
     chatHistory?: BaseMessage[];
-    originalMessageId?: number; // Add this to store the original message ID
+    originalMessageId?: number; // Store the original message ID
     currentPatternState: number | string;
     metadata?: {
         isReply?: boolean;
@@ -880,10 +885,13 @@ export interface PatternContextData {
         hasFile?: boolean;
         fileType?: string;
         suggestion?: any; // Store the suggestion in metadata
+        isResponse?: boolean; // Add this property for response context
+        responseLength?: number; // Add this for response size information
     };
     processed?: boolean; // Flag to indicate if pattern processing has been completed
     processedContent?: string; // The result of pattern processing
 }
+
 // Update the PatternAnalysis interface
 export interface PatternAnalysis {
     characteristics: {
@@ -905,6 +913,7 @@ export interface PatternAnalysis {
 }
 
 
+// In types.ts
 export interface PatternData {
     originalInput: string;
     inputChunks?: {
@@ -919,10 +928,13 @@ export interface PatternData {
             chunks?: string[];
             currentChunk?: number;
             messageIds?: number[];
+            menuMessageId?: number;  
             sourceName?: string;
             sourceChunkIndex?: number;
-            batchResults?: Array<string>;  // Add this property
-            isBatch?: boolean;            // Add this property
+            batchResults?: Array<string>; 
+            isBatch?: boolean;            
+            sourceCitations?: SourceCitation[]; 
+
         }
     };
     currentPatternState: {
@@ -932,4 +944,54 @@ export interface PatternData {
         useProcessedOutput?: string;
         selectedInputChunk?: number;
     };
+    
+    sourceInfo?: {
+        title?: string;
+        url?: string;
+        type?: string;
+        metadata?: any;
+    };
+
+    contextInfo?: {
+        relevantContext?: string;
+        lastUpdated?: number;
+    };
+}
+
+// Add these interfaces to types.ts or a new file
+export interface QuestionAnalysisResult {
+    isQuestion: boolean;
+    confidence: number;
+    possibleTargets: string[];
+    sensitivity: 'low' | 'medium' | 'high';
+    knowledgeRequired: 'general' | 'specific' | 'personal';
+    recommendedAction: 'answer' | 'offer_help' | 'stay_silent' | 'continue_conversation';
+    requiresRagMode: boolean;
+    reasoning: string;
+}
+
+export interface ConversationContext {
+    isOngoing: boolean;
+    lastBotMessageTimestamp: number;
+    recentMessages: number;
+    recentMentions: number;
+    lastUserIds: string[];
+}
+
+// Define the cached question data type
+export interface CachedQuestionData {
+    userId: string;
+    sessionId: string;
+    question: string;
+    analysis: QuestionAnalysisResult;
+    timestamp: number;
+}
+
+export type TranscriptionProvider = 'local-cuda' | 'local-cpu' | 'assemblyai' | 'google' | 'azure' | 'aws' | 'ibm';
+
+export interface TranscriptionOptions {
+  provider?: TranscriptionProvider;
+  modelSize?: 'tiny' | 'base' | 'small' | 'medium' | 'large';
+  language?: string;
+  apiKey?: string;
 }

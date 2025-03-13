@@ -2124,7 +2124,7 @@ export class DatabaseService {
             if (!conversation || conversation.user_id !== userId) {
                 throw new Error('Conversation not found or unauthorized');
             }
-    
+
             logInfo(methodName, 'Starting conversation update:', {
                 conversationId,
                 userId,
@@ -2133,17 +2133,17 @@ export class DatabaseService {
                 hasDescription: !!options.description,
                 hasTags: !!options.tags
             });
-    
+
             // Start transaction
             await this.botDb.run('BEGIN TRANSACTION');
-    
+
             try {
                 // Get existing conversation data to preserve fields if not provided
                 const existingConversation = await this.botDb.get(
                     'SELECT title, description, tags, is_favorite FROM saved_conversations WHERE id = ? AND user_id = ?',
                     [conversationId, userId]
                 );
-    
+
                 if (!existingConversation) {
                     logError(methodName, 'Conversation not found during update:', {
                         conversationId,
@@ -2151,7 +2151,7 @@ export class DatabaseService {
                     });
                     throw new Error(`Conversation ${conversationId} not found or access denied`);
                 }
-    
+
                 // Handle tags with detailed logging
                 let normalizedTags;
                 if (options.tags) {
@@ -2164,7 +2164,7 @@ export class DatabaseService {
                 } else {
                     normalizedTags = existingConversation.tags;
                 }
-    
+
                 // Update conversation metadata and last_accessed
                 const updateResult = await this.botDb.run(
                     `UPDATE saved_conversations
@@ -2184,44 +2184,44 @@ export class DatabaseService {
                         userId
                     ]
                 );
-    
+
                 // Verify metadata update
                 if (!updateResult?.changes) {
                     throw new Error(`Failed to update conversation metadata for ID: ${conversationId}`);
                 }
-    
+
                 // Delete existing messages
                 await this.botDb.run(
                     'DELETE FROM conversation_messages WHERE conversation_id = ?',
                     [conversationId]
                 );
-    
+
                 // Sort messages by timestamp in ascending order (oldest first)
                 const sortedMessages = [...messages].sort((a, b) => {
                     const timeA = new Date(a.timestamp || 0).getTime();
                     const timeB = new Date(b.timestamp || 0).getTime();
                     return timeA - timeB;
                 });
-    
+
                 // Use bulk insert for better performance
                 await this.bulkInsertMessages(conversationId, sortedMessages, methodName);
-    
+
                 // Verify messages were inserted correctly
                 await this.verifyMessages(conversationId, sortedMessages, methodName);
-    
+
                 // All operations successful, commit the transaction
                 await this.botDb.run('COMMIT');
-    
+
                 logInfo(methodName, 'Conversation updated successfully:', {
                     conversationId,
                     userId,
                     messageCount: messages.length
                 });
-    
+
             } catch (error) {
                 // Any error during the process, rollback everything
                 await this.botDb.run('ROLLBACK');
-    
+
                 // Enhance error message based on error type
                 let errorMessage = 'Failed to update conversation';
                 if (error instanceof Error) {
@@ -2233,7 +2233,7 @@ export class DatabaseService {
                         errorMessage = `Content verification failed: ${error.message}`;
                     }
                 }
-    
+
                 logError(methodName, errorMessage, error as Error, {
                     conversationId,
                     userId,
@@ -2244,7 +2244,7 @@ export class DatabaseService {
                         errorMessage: error instanceof Error ? error.message : String(error)
                     }
                 });
-    
+
                 throw new Error(errorMessage);
             }
         } catch (error) {
@@ -2428,18 +2428,18 @@ export class DatabaseService {
     }>> {
         const methodName = 'getConversationMessages';
         if (!this.botDb) throw new Error('Database not initialized');
-    
+
         try {
             // Verify user owns this conversation
             const conversation = await this.botDb.get(
                 'SELECT id FROM saved_conversations WHERE id = ? AND user_id = ?',
                 [conversationId, userId]
             );
-    
+
             if (!conversation) {
                 throw new Error('Conversation not found or access denied');
             }
-    
+
             // Get messages in chronological order (oldest first)
             const messages = await this.botDb.all(
                 `SELECT role, content, timestamp, metadata, rowid
@@ -2456,7 +2456,7 @@ export class DatabaseService {
                     END ASC`,
                 [conversationId]
             );
-    
+
             logInfo(methodName, 'Retrieved messages:', {
                 conversationId,
                 count: messages.length,
@@ -2466,7 +2466,7 @@ export class DatabaseService {
                     preview: (m.content || '').substring(0, 50)
                 }))
             });
-    
+
             // Process messages while maintaining order
             const processedMessages = messages.map(msg => {
                 // Parse metadata if it exists
@@ -2476,10 +2476,10 @@ export class DatabaseService {
                 } catch (error) {
                     logError(methodName, 'Error parsing message metadata:', error as Error);
                 }
-    
+
                 // Ensure proper newline handling
                 const content = msg.content || '';
-    
+
                 logInfo(methodName, 'Processing message:', {
                     role: msg.role,
                     timestamp: msg.timestamp,
@@ -2488,7 +2488,7 @@ export class DatabaseService {
                     hasNewlines: content.includes('\n'),
                     preview: content.substring(0, 50)
                 });
-    
+
                 // Preserve original timestamp
                 return {
                     role: msg.role,
@@ -2497,7 +2497,7 @@ export class DatabaseService {
                     metadata
                 };
             });
-    
+
             logInfo(methodName, 'Final message order:', {
                 conversationId,
                 messageOrder: processedMessages.map(m => ({
@@ -2505,14 +2505,14 @@ export class DatabaseService {
                     preview: m.content.substring(0, 50)
                 }))
             });
-    
+
             return processedMessages;
         } catch (error) {
             logError(methodName, 'Error getting conversation messages:', error as Error);
             throw error;
         }
     }
-    
+
     public async getConversationCount(userId: string): Promise<number> {
         const methodName = 'getConversationCount';
         if (!this.botDb) throw new Error('Database not initialized');
@@ -2586,14 +2586,14 @@ export class DatabaseService {
         methodName: string
     ): Promise<void> {
         if (!this.botDb) throw new Error('Database not initialized');
-    
+
         // Create parameterized query with multiple value sets
         const placeholders = messages.map(() => '(?, ?, ?, ?, ?)').join(',');
         const query = `
             INSERT INTO conversation_messages (id, conversation_id, role, content, timestamp)
             VALUES ${placeholders}
         `;
-    
+
         // Flatten message data into array of parameters
         const params = messages.flatMap(msg => [
             `msg_${uuidv4()}`,
@@ -2602,10 +2602,10 @@ export class DatabaseService {
             msg.content || msg.message || '',
             this.normalizeTimestamp(msg.timestamp)
         ]);
-    
+
         try {
             await this.botDb.run(query, params);
-            
+
             logInfo(methodName, 'Bulk insert completed:', {
                 conversationId,
                 messageCount: messages.length
@@ -2618,7 +2618,7 @@ export class DatabaseService {
             throw error;
         }
     }
-    
+
     private normalizeTimestamp(timestamp: string): string {
         try {
             if (!timestamp) {
@@ -2648,19 +2648,19 @@ export class DatabaseService {
                 END ASC`,
             [conversationId]
         );
-    
+
         if (insertedMessages.length !== originalMessages.length) {
             throw new Error(`Message count mismatch: expected ${originalMessages.length}, got ${insertedMessages.length}`);
         }
-    
+
         // Verify content matches
         for (let i = 0; i < originalMessages.length; i++) {
             const original = originalMessages[i];
             const inserted = insertedMessages[i];
-            
+
             const originalContent = original.content || original.message || '';
             const insertedContent = inserted.content || '';
-            
+
             if (originalContent !== insertedContent) {
                 throw new Error(`Content mismatch at position ${i}`);
             }
@@ -2675,7 +2675,47 @@ export class DatabaseService {
         await this.updateConversation(conversationId, userId, messages, options);
         return this.getConversationById(conversationId, userId);
     }
+    
+    // Add this method to DatabaseService class
+    public async getActiveSessions(limit: number = 100): Promise<SessionInfo[]> {
+        const methodName = 'getActiveSessions';
+        if (!this.botDb) throw new Error('Database not initialized');
 
+        try {
+            const query = `
+            SELECT id, user_id as userId, type, source, chat_id, status
+            FROM sessions 
+            WHERE status = 'active'
+            ORDER BY last_active DESC
+            LIMIT ?
+        `;
+
+            const sessions = await this.botDb.all(query, [limit]);
+
+            logInfo(methodName, `Retrieved ${sessions.length} active sessions`);
+
+            return sessions.map(session => ({
+                id: session.id,
+                userId: session.userId,
+                sessionId: session.id,
+                type: session.type as 'private' | 'group',
+                source: session.source as 'telegram' | 'flowise' | 'webapp',
+                chat_id: session.chat_id,
+                status: session.status,
+                created_at: '',     // Default values for required fields
+                last_active: '',
+                expires_at: '',
+                auth: {             // Default auth object
+                    type: session.source || 'telegram',
+                    id: session.userId,
+                    username: ''
+                }
+            }));
+        } catch (error) {
+            logError(methodName, 'Error retrieving active sessions', error as Error);
+            return [];
+        }
+    }
     // Add methods for user management, chat history, etc.
 
 }

@@ -4,8 +4,9 @@ import { ICommonObject, INode, INodeData, INodeParams, FlowiseMemory, IVisionCha
 import { Telegraf, Context, Markup } from 'telegraf';
 import { BaseMessage, HumanMessage, AIMessage, SystemMessage, MessageContent } from '@langchain/core/messages';
 import { VectorStore } from '@langchain/core/vectorstores';
-import { Update, User, Chat, Message } from 'telegraf/typings/core/types/typegram';
+import { Update, User, Chat, Message, ChatMember, InputFile } from 'telegraf/typings/core/types/typegram';
 import { ExtraReplyMessage } from 'telegraf/typings/telegram-types';
+import { QuestionAnalyzer, QuestionAnalysisResult } from './QuestionAnalyzer';
 import {
     logDebug,
     logInfo,
@@ -18,7 +19,6 @@ import { BaseRetriever } from '@langchain/core/retrievers';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { Tool } from 'langchain/tools';
 import { Document } from 'langchain/document';
-import { ChatMember } from 'telegraf/typings/core/types/typegram';
 import { ConversationManager } from './ConversationManager';
 import { CustomRetriever, DummyRetriever } from './CustomRetriever';
 import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../src/utils';
@@ -28,7 +28,9 @@ import { MemoryType, BotInfo, IExtendedMemory, ExtendedIMessage, IUpdateMemory, 
 import { messageContentToString } from './utils/utils';
 import { addImagesToMessages, llmSupportsVision } from '../../../src/multiModalUtils';
 import ToolManager from './ToolManager';
+import { FileManager } from './FileManager';
 import { YouTubeTool } from './tools/YouTubeTool';
+import { RumbleTool } from './tools/RumbleTool';
 import PromptManager from './PromptManager';
 import { AgentManager } from './AgentManager';
 import { ContextAdapter } from './ContextAdapter';
@@ -37,10 +39,9 @@ import { MenuManager } from './MenuManager';
 import { AccountManager } from './AccountManager';
 import { FormatConverter } from './utils/FormatConverter';
 import { handleNonTelegramMessage } from './handleNonTelegramMessage';
-import { InteractionType, EnhancedResponse, SourceCitation, UserCitationData, PatternContextData } from './commands/types';
+import { InteractionType, EnhancedResponse, SourceCitation, UserCitationData, PatternContextData, ScoredDocument } from './commands/types';
 import { v4 as uuidv4 } from 'uuid';
 import { formatResponse } from '../../outputparsers/OutputParserHelpers';
-import { streamResponse } from '../../moderation/Moderation';
 import NodeCache from 'node-cache';
 import { Mutex } from 'async-mutex';
 import {
@@ -53,15 +54,19 @@ import {
     type UserData
 } from './services/DatabaseService';
 import { AuthService } from './services/AuthService';
-import { LifelineType, GameState } from './commands/types';
+import { LifelineType, GameState, PatternData } from './commands/types';
 import { GameAgent } from './agents/GameAgent';
 import { PatternPromptAgent } from './agents/PatternPromptAgent';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 
 
 
 const botInstanceCache = new NodeCache({ stdTTL: 0, checkperiod: 600, useClones: false });
 const botInitializationLocks: { [key: string]: Mutex } = {};
 const flowIdMap = new Map<string, string>(); // Maps botKey to flowId
+const execAsync = promisify(exec);
+
 
 function getOrCreateFlowId(botKey: string): string {
     let flowId = flowIdMap.get(botKey);
@@ -75,7 +80,13 @@ function getOrCreateFlowId(botKey: string): string {
     return flowId;
 }
 
-
+interface CachedQuestionData {
+    userId: string;
+    sessionId: string;
+    question: string;
+    analysis: QuestionAnalysisResult;
+    timestamp: number;
+}
 interface INodeOutput {
     label: string;
     name: string;
@@ -140,11 +151,12 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
     private agentManager: AgentManager;
     private collaboratingAgents: TelegramBot_Agents[] = [];
     private toolManager: ToolManager;
+    private fileManager: FileManager;
     public promptManager: PromptManager | null;
     private ragAgent: RAGAgent;
     private groupMembers: Map<number, Map<number, GroupMemberInfo>> = new Map();
     private botIds: number[] = [];
-    private botInfo: BotInfo[];
+    public botInfo: BotInfo[];
     public menuManager: MenuManager;
     private awaitingQuestionSelection: Map<number, boolean> = new Map();
     private userQuestions: Map<number, UserQuestionData> = new Map();
@@ -158,6 +170,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
     public readonly DEFAULT_TOKEN_QUOTA = 25000; // Adjust as needed
     private accountManager: AccountManager;
     public databaseService: DatabaseService;
+    private questionAnalyzer: QuestionAnalyzer;
     public authService: AuthService;
     private updateBuffer: Map<string, {
         updates: Context<Update>[];
@@ -167,9 +180,20 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
     private readonly MESSAGE_JOINING_WINDOW = 5000; // 5 seconds (up from 3)
     private readonly MAX_BUFFERED_UPDATES = 15; // Increased from 10
+    private botMessageRegistry: Map<string, Set<number>> = new Map();
+    private readonly MESSAGE_HISTORY_LIMIT = 1000; // Max messages to track per chat
+    private readonly CONVERSATION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    private periodicLoggers: Map<string, NodeJS.Timeout> = new Map();
 
 
 
+    public getBotToken(): string {
+        return this.botToken;
+    }
+    // Add to TelegramBot_Agents class
+    public getBot(): Telegraf<Context<Update>> {
+        return this.bot!;
+    }
     public getToolManager(): ToolManager {
         return this.toolManager;
     }
@@ -453,6 +477,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 additionalParams: true
             }
         );
+
     }
 
 
@@ -600,7 +625,23 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 console.warn('No separate utilityModel model provided. Using chatModel for utility tasks.');
                 this.utilityModel = this.chatModel;
             }
+            // Initialize QuestionAnalyzer
+            if (this.utilityModel) {
+                this.questionAnalyzer = new QuestionAnalyzer(
+                    this.utilityModel,
+                    this.summationModel,
+                    this.chatModel,
+                    this.SpModel,
+                    this.flowId
+                );
+                console.log(`[FlowID: ${this.flowId}] QuestionAnalyzer initialized`);
 
+                // Only set up cleanup after questionAnalyzer is initialized
+                this.setupCleanupTasks();
+            } else {
+                // In case we need cleanup tasks even without questionAnalyzer
+                this.setupCleanupTasks();
+            }
             // Initialize memory
             console.log("Memory input:", nodeData.inputs?.memory);
             if (nodeData.inputs?.memory) {
@@ -647,7 +688,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             const welcomeMessage = nodeData.inputs?.welcomeMessage as string || 'Welcome! How can I assist you today?';
             const idleTimeout = nodeData.inputs?.idleTimeout as number || 300;
             const toolAgentSystemPrompt = nodeData.inputs?.toolAgentSystemPrompt as string || PromptManager.defaultToolAgentSystemPrompt();
-            
+
             // Initialize ToolManager first, before any agents
             console.log("Initializing ToolManager...");
             const tools: Tool[] = nodeData.inputs?.tools as Tool[] || [];
@@ -661,7 +702,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             }
             const availableTools = this.toolManager.getToolNames();
             console.log(`[${this.flowId}] Available tools: ${availableTools.join(', ') || 'none'}`);
-            
+
             this.agentManager = new AgentManager(this.flowId, this.toolManager, this.promptManager);
 
             this.menuManager = new MenuManager(this, this.flowId); // Pass flowId as string
@@ -788,6 +829,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 enablePersona: nodeData.inputs?.enablePersona as boolean || false,
                 toolAgentSystemPrompt: nodeData.inputs?.toolAgentSystemPrompt as string || PromptManager.defaultToolAgentSystemPrompt(),
                 agentManager: this.agentManager,
+                menuManager: this.menuManager,
                 promptManager: this.promptManager,
                 flowId: this.flowId,
                 flowIdMap: flowIdMap,
@@ -821,6 +863,13 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 this.bot = null;
                 // Any other cleanup operations...
             };
+            const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+            if (ragAgent) {
+                const loggingTimer = ragAgent.startActiveUserLogging();
+                // Store the timer reference for cleanup during stop
+                this.periodicLoggers = this.periodicLoggers || new Map();
+                this.periodicLoggers.set('ragStatus', loggingTimer);
+            }
             console.log("Prompts initialized:");
             console.log("RAG System Prompt:", this.ragSystemPrompt);
             console.log("General System Prompt:", this.generalSystemPrompt);
@@ -853,7 +902,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             // Initialize Telegram bot
             if (!this.bot) {
                 this.bot = new Telegraf<Context>(this.botToken, {
-                    handlerTimeout: 600000 // 4 minutes in milliseconds
+                    handlerTimeout: 600000 // 10 minutes in milliseconds
                 });
 
                 try {
@@ -861,6 +910,8 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                     this.setupActionHandlers();
                     this.setupMessageHandlers(interactionType!);
                     this.botId = botInfo.id;
+                    // Initialize message registry
+                    await this.initializeMessageRegistry();
                     console.log(`[FlowID: ${this.flowId}] Bot initialized with ID: ${this.botId}`);
                 } catch (error) {
                     console.error(`[FlowID: ${this.flowId}] Error getting bot info:`, error);
@@ -906,6 +957,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                     this.agentManager,
                     this.menuManager,
                     this.toolManager,
+                    this.fileManager,
                     this.flowId,
                     {
                         telegramBot: this
@@ -939,6 +991,37 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 } else {
                     console.warn(`[${this.flowId}] YouTube API key not found in environment variables, YouTube functionality will be disabled`);
                 }
+                // When initializing FileManager in TelegramBot_Agents:
+                const botName = this.botInfo.length > 0 ? this.botInfo[0].firstName : 'Telegram Bot';
+                this.fileManager = new FileManager(this.botToken, botName);
+
+                if (this.agentManager) {
+                    const toolManager = this.getToolManager();
+
+                    // Register YouTube tool if API key is available
+                    if (process.env.YOUTUBE_API_KEY) {
+                        const youtubeTool = new YouTubeTool(process.env.YOUTUBE_API_KEY);
+                        toolManager.addTool(youtubeTool);
+                        console.log(`[${this.flowId}] YouTube tool registered successfully`);
+                    } else {
+                        console.warn(`[${this.flowId}] YouTube API key not found in environment variables, YouTube functionality will be limited`);
+                    }
+
+                    // Register Rumble tool (will check for yt-dlp internally)
+                    const rumbleTool = new RumbleTool('./temp/rumble');
+                    toolManager.addTool(rumbleTool);
+                    console.log(`[${this.flowId}] Rumble tool registered (yt-dlp capabilities will be determined at runtime)`);
+
+                    // Optionally, check and log yt-dlp status
+                    this.checkYtDlpAvailability().then(available => {
+                        if (available) {
+                            console.log(`[${this.flowId}] yt-dlp is available, full Rumble functionality enabled`);
+                        } else {
+                            console.warn(`[${this.flowId}] yt-dlp is not available, Rumble transcript extraction will be limited`);
+                            console.warn(`To enable full Rumble support, please install yt-dlp: https://github.com/yt-dlp/yt-dlp#installation`);
+                        }
+                    });
+                }
 
                 // Create and register the game agent
                 const gameAgent = new GameAgent(
@@ -957,6 +1040,21 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                     this.promptManager
                 );
                 this.agentManager.registerAgent('pattern', patternAgent);
+
+                const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                if (ragAgent) {
+                    // Instead of calling startActiveUserLogging directly, use our wrapper method
+                    this.setPeriodicLogger('ragActivityReport', () => {
+                        try {
+                            const report = ragAgent.generateRagUsageReport();
+                            console.log(`[RAG Activity Report] ${JSON.stringify(report)}`);
+                        } catch (error) {
+                            console.error(`[RAG Activity Report] Error generating report:`, error);
+                        }
+                    }, 15 * 60 * 1000); // 15 minutes
+
+                    console.log(`[FlowID: ${this.flowId}] Initialized RAG activity status logging`);
+                }
             }
 
             // Set component references
@@ -968,7 +1066,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
             this.isInitialized = true;
             options.telegramBotInstance = this;
-
+            this.setupCleanupTasks();
             console.log('PromptManager state:', this.promptManager ? 'Initialized' : 'Not initialized');
             console.log('[performInitialization] TelegramBot_Agents initialization completed successfully');
         } catch (error) {
@@ -976,6 +1074,56 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             this.isInitialized = false;
             throw error;
         }
+    }
+    private initializeQuestionAnalyzer(): void {
+        // Inside the TelegramBot_Agents init or performInitialization method
+
+        // Initialize QuestionAnalyzer with all required models
+        if (this.utilityModel && this.summationModel && this.chatModel && this.SpModel) {
+            this.questionAnalyzer = new QuestionAnalyzer(
+                this.utilityModel,
+                this.summationModel,
+                this.chatModel,
+                this.SpModel,
+                this.flowId
+            );
+            console.log(`[FlowID: ${this.flowId}] QuestionAnalyzer initialized with all models`);
+        } else {
+            console.warn(`[FlowID: ${this.flowId}] Could not initialize QuestionAnalyzer - required models not available`);
+        }
+    }
+
+    /**
+     * Updates conversation tracking information when bot sends or receives messages
+     */
+    private updateConversationTracking(
+        adapter: ContextAdapter,
+        isBotMessage: boolean,
+        botMentioned: boolean = false
+    ): void {
+        if (!this.questionAnalyzer) return;
+
+        const context = adapter.getMessageContext();
+        const chatId = context.chatId.toString();
+        const userId = context.userId.toString();
+
+        // Update conversation tracking in the question analyzer
+        this.questionAnalyzer.updateConversationContext(
+            chatId,
+            userId,
+            isBotMessage,
+            botMentioned
+        );
+    }
+
+    /**
+     * Checks if a conversation is active in a given chat
+     */
+    private isActiveConversation(chatId: string): boolean {
+        if (!this.questionAnalyzer) return false;
+
+        const conversationContext = this.questionAnalyzer.getConversationContext(chatId);
+        return conversationContext.isOngoing;
     }
     // Add the postProcessDocuments method to the TelegramBot_Agents class, to do with MultiQueryTelegramBot node if not connected, May not be used here:
 
@@ -989,7 +1137,12 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         // For now, we'll just return the documents as-is
         return docs;
     }
-
+    /**
+     * Returns the QuestionAnalyzer instance
+     */
+    public getQuestionAnalyzer(): QuestionAnalyzer | null {
+        return this.questionAnalyzer;
+    }
 
     private setupMessageHandlers(progressKey: string, interactionType?: InteractionType): void {
         if (!this.bot) {
@@ -1405,70 +1558,62 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
     }
 
 
-    public getGroupMembers(chatId: number): Map<number, GroupMemberInfo> | undefined {
-        return this.groupMembers.get(chatId);
-    }
+    /**
+  * Gets the group members for a chat
+  * Attempts to fetch them if not available in memory
+  */
+    public async getGroupMembers(chatId: number | string): Promise<Map<number, GroupMemberInfo> | undefined> {
+        const methodName = 'getGroupMembers';
+        const chatIdNum = typeof chatId === 'string' ? parseInt(chatId, 10) : chatId;
 
-    public async updateGroupMembers(ctx: Context): Promise<void> {
-        console.log("Entering updateGroupMembers");
-        if (!ctx.chat) {
-            console.error('Chat context is undefined');
-            return;
-        }
+        // Try to get cached members first
+        let members = this.groupMembers.get(chatIdNum);
 
-        if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+        // If we don't have members and bot is available, try to fetch them
+        if (!members && this.bot) {
             try {
-                const chatId = ctx.chat.id;
-                console.log(`Fetching members for chat ${chatId}`);
+                logInfo(methodName, `No cached members for chat ${chatIdNum}, attempting to fetch`);
 
-                // Fetch administrators
-                const admins = await ctx.telegram.getChatAdministrators(chatId);
-                console.log(`Fetched ${admins.length} administrators`);
+                // Create a new map for this chat
+                members = new Map<number, GroupMemberInfo>();
 
-                // Initialize member info map
-                const memberInfo = new Map<number, GroupMemberInfo>();
+                // Fetch administrators first as they're always accessible
+                const admins = await this.bot.telegram.getChatAdministrators(chatIdNum);
 
-                // Add admins to the member info
-                admins.forEach((admin: ChatMember) => {
-                    memberInfo.set(admin.user.id, {
+                // Add admins to the map
+                for (const admin of admins) {
+                    members.set(admin.user.id, {
                         is_bot: admin.user.is_bot,
                         is_admin: true,
                         username: admin.user.username,
                         first_name: admin.user.first_name
                     });
-                });
+                }
 
-                // Add known bots from BotInfo
-                this.botInfo.forEach(bot => {
-                    if (!memberInfo.has(bot.id)) {
-                        memberInfo.set(bot.id, {
+                // Add known bots from botInfo
+                for (const bot of this.botInfo) {
+                    if (!members.has(bot.id)) {
+                        members.set(bot.id, {
                             is_bot: true,
                             is_admin: false,
                             username: bot.username,
                             first_name: bot.firstName
                         });
                     }
-                });
-
-                this.groupMembers.set(chatId, memberInfo);
-                if (this.conversationManager) {
-                    this.conversationManager.setGroupMembers(chatId, memberInfo);
-                    console.log(`Group members set in ConversationManager for chat ${chatId}`);
-                } else {
-                    console.error('ConversationManager is not initialized');
                 }
 
-                console.log(`Updated group members for chat ${chatId}`);
-                await ctx.reply(`Group member list updated.`);
+                // Store in cache
+                this.groupMembers.set(chatIdNum, members);
 
+                logInfo(methodName, `Fetched ${members.size} members for chat ${chatIdNum}`);
             } catch (error) {
-                console.error('Error updating group members:', error);
-                await ctx.reply('Failed to update group member list.');
+                logError(methodName, `Error fetching members for chat ${chatIdNum}`, error as Error);
+                // Return undefined if we couldn't fetch members
+                return undefined;
             }
-        } else {
-            console.log("Not a group chat, skipping member update");
-            await ctx.reply('This command can only be used in group chats.');
         }
+
+        return members;
     }
     private async handleConfirmClearMemory(ctx: Context) {
         console.log('Entering handleConfirmClearMemory');
@@ -2010,6 +2155,14 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 }
             }
 
+            if (this.periodicLoggers) {
+                for (const [name, timer] of this.periodicLoggers.entries()) {
+                    clearInterval(timer);
+                    console.log(`[FlowID: ${this.flowId}] Cleared periodic logger: ${name}`);
+                }
+                this.periodicLoggers.clear();
+            }
+
             // Clean up managers
             await this.cleanupManagers();
 
@@ -2031,6 +2184,18 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
     private async cleanupManagers(): Promise<void> {
         console.log(`[FlowID: ${this.flowId}] Cleaning up managers...`);
+
+        // Clear periodic loggers
+        for (const [name, timer] of this.periodicLoggers.entries()) {
+            clearInterval(timer);
+            console.log(`[FlowID: ${this.flowId}] Cleared periodic logger: ${name}`);
+        }
+        this.periodicLoggers.clear();
+
+        if (this.conversationManager) {
+            await this.conversationManager.cleanup();
+            (this.conversationManager as any) = null;
+        }
 
         if (this.conversationManager) {
             await this.conversationManager.cleanup();
@@ -2063,6 +2228,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 null as any, // menuManager
                 null as any, // flowId
                 null as any, // toolManager
+                null as any, // fileManager
                 { telegramBot: this }
             );
         }
@@ -2073,6 +2239,48 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         }
 
         console.log(`[FlowID: ${this.flowId}] Managers cleaned up successfully.`);
+    }
+    // In TelegramBot_Agents.ts, add a new method:
+    /**
+     * Adds or updates a periodic logger
+     * @param name Unique name for the logger
+     * @param interval Function to execute periodically
+     * @param intervalMs Time between executions in milliseconds
+     */
+    public setPeriodicLogger(name: string, interval: () => void, intervalMs: number): void {
+        // Clear any existing timer with this name
+        const existingTimer = this.periodicLoggers.get(name);
+        if (existingTimer) {
+            clearInterval(existingTimer);
+            console.log(`[FlowID: ${this.flowId}] Cleared existing periodic logger: ${name}`);
+        }
+
+        // Set the new timer
+        const timer = setInterval(interval, intervalMs);
+        this.periodicLoggers.set(name, timer);
+        console.log(`[FlowID: ${this.flowId}] Set periodic logger: ${name}, interval: ${intervalMs}ms`);
+    }
+
+    /**
+     * Removes a periodic logger
+     * @param name Name of the logger to remove
+     */
+    public clearPeriodicLogger(name: string): void {
+        const timer = this.periodicLoggers.get(name);
+        if (timer) {
+            clearInterval(timer);
+            this.periodicLoggers.delete(name);
+            console.log(`[FlowID: ${this.flowId}] Removed periodic logger: ${name}`);
+        }
+    }
+
+    /**
+     * Checks if a periodic logger exists
+     * @param name Name of the logger to check
+     * @returns True if the logger exists
+     */
+    public hasPeriodicLogger(name: string): boolean {
+        return this.periodicLoggers.has(name);
     }
 
     private removeChatFlowMapping(): void {
@@ -2124,15 +2332,19 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             context.input.replace(new RegExp(`@${this.bot?.botInfo?.username}\\b`, 'i'), '').trim();
     }
 
-    public async updateProgress(adapter: ContextAdapter, progressKey: string, stage: string): Promise<boolean> {
-        console.log(`[TelegramBot_Agents:${this.flowId}] Called updateProgress with key: ${progressKey}, stage: ${stage}`);
 
-        if (!adapter.isTelegramMessage()) {
-            console.log(`[TelegramBot_Agents:${this.flowId}] Skipping update for non-Telegram message.`);
+    public async updateProgress(adapter: ContextAdapter, progressKey: string, stage: string): Promise<boolean> {
+        try {
+            if (!adapter.isTelegramMessage()) {
+                return false;
+            }
+
+            return await adapter.updateProgress(this.flowId, progressKey, stage);
+        } catch (error) {
+            // Just log the error but don't let it stop processing
+            console.warn(`[${this.flowId}] Error updating progress: ${error.message}`);
             return false;
         }
-
-        return await adapter.updateProgress(this.flowId, progressKey, stage);
     }
 
     private splitMessage(text: string, maxLength: number): string[] {
@@ -2165,9 +2377,164 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return;
         }
 
-        const data = context.callbackQuery.data.trim().toLowerCase();
+        const data = context.callbackQuery.data.trim();
         console.log('Received callback query data:', data);
 
+        // Handle question answer requests
+        if (data.startsWith('answer_question:') || data.startsWith('ignore_question:')) {
+            const [action, messageIdStr] = data.split(':');
+            const messageId = parseInt(messageIdStr, 10);
+
+            // Acknowledge the callback
+            await adapter.safeAnswerCallbackQuery('Got it!');
+
+            if (action === 'ignore_question') {
+                // Since we don't have direct access to message_id in the interface,
+                // we need to use a more type-safe approach
+
+                // Use adapter's deleteMessage which should handle this properly
+                if (context.callbackQuery?.message) {
+                    // Let the adapter handle extracting the message ID
+                    await adapter.deleteMessage();
+                }
+                return;
+            }
+
+            // For "answer_question", retrieve the stored question
+            const cacheKey = `pending_question:${messageId}`;
+            const questionData = this.conversationManager?.cache.get<CachedQuestionData>(cacheKey);
+
+            if (!questionData) {
+                await adapter.reply("I'm sorry, but I can't retrieve that question anymore.");
+                return;
+            }
+
+            const { question, analysis, userId, sessionId } = questionData;
+
+
+
+            // Set RAG mode if the analysis recommends it
+            if (analysis.requiresRagMode) {
+                const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                if (ragAgent) {
+                    ragAgent.toggleRAGMode(userId, true);
+                    logInfo(methodName, 'Enabled RAG mode for question', { userId });
+                }
+            }
+
+            // Process the question
+            try {
+                let sentConfirmation;
+                // Get chat history
+                const chatHistory = await this.getChatHistory(adapter);
+                const chatId = adapter.getMessageContext().chatId;
+                const processingText = "⏳ Processing your question...";
+                sentConfirmation = await adapter.reply(processingText);
+                const progressKey = `${chatId}:${sentConfirmation.message_id}`;
+
+
+                // Prepare a detailed reply that acknowledges the question
+                const fullQuestion = `Question from the group chat: "${question}"`;
+                const initialConfirmation = this.getRandomConfirmationMessage();
+                this.progressMessages.set(progressKey, initialConfirmation);
+
+
+                try {
+                    sentConfirmation = await adapter.reply(initialConfirmation);
+                    // const progressKey = `${chatId}:${messageId}`;
+                    this.sentConfirmations.set(progressKey, sentConfirmation.message_id);
+                    // this.progressMessages.set(progressKey, initialConfirmation);
+                    console.log(`[${methodName}] Set initial progress for key: ${progressKey}`);
+                } catch (error) {
+                    console.error('Error sending confirmation message:', error);
+                }
+                try {
+
+                    if (sentConfirmation) {
+                        console.log(methodName, `Attempting to update progress for Answer Question`);
+                        const updated = await this.updateProgress(adapter, progressKey, "⌛️");
+                        console.log(methodName, `Progress update result: ${updated}`);
+                        console.log(`[${methodName}] Progress update for progressKey: ${progressKey}`);
+
+                    }
+
+                    // Process with our existing methods
+                    const enhancedResponse = await this.processUserInput(
+                        adapter,
+                        fullQuestion,
+                        chatHistory,
+                        false, // isAI
+                        false, // isReply
+                        { message_id: messageId, text: question }, // Original question as replyToMessage
+                        false, // isFollowUp
+                        interactionType,
+                        progressKey
+                    );
+                    if (sentConfirmation) {
+                        console.log(methodName, `Attempting to update progress Finalizing the response`);
+                        await this.updateProgress(adapter, progressKey, "✔️Finalizing the response...💥");
+                    }
+
+                    // Delete the "I'm working on it" message from the callback
+                    if (context.callbackQuery?.message) {
+                        try {
+                            await adapter.deleteMessage();
+                        } catch (error) {
+                            console.warn('Failed to delete callback message:', error.message);
+                        }
+                    }
+
+                    this.conversationManager?.cache.del(cacheKey);
+
+                } catch (error) {
+                    logError(methodName, 'Error processing question from callback', error as Error);
+
+                    // Try to inform the user of the error
+                    try {
+                        if (context.callbackQuery?.message) {
+                            await adapter.editMessageText(
+                                "I'm sorry, but I encountered an error while processing this question."
+                            );
+                        } else {
+                            await adapter.reply("I'm sorry, but I encountered an error while processing this question.");
+                        }
+                    } catch (replyError) {
+                        console.error('Error sending error message:', replyError);
+                    }
+                } finally {
+                    // Clean up any progress message
+                    if (sentConfirmation) {
+                        try {
+                            // Wait a short time before deleting the confirmation message
+                            setTimeout(async () => {
+                                try {
+                                    await adapter.deleteMessage(sentConfirmation.message_id);
+                                    const finalProgressKey = progressKey;
+                                    this.progressMessages.delete(finalProgressKey);
+                                    this.sentConfirmations.delete(finalProgressKey);
+                                    console.log(`[${methodName}] Cleaned up progress messages`);
+                                } catch (cleanupError) {
+                                    console.warn('Failed to clean up confirmation message:', cleanupError.message);
+                                }
+                            }, 3000); // 3 seconds delay
+                        } catch (error) {
+                            console.error('Error scheduling confirmation message cleanup:', error);
+                        }
+                    }
+                }
+            } catch (error) {
+                logError(methodName, 'Error processing question from callback', error as Error);
+
+                if (context.callbackQuery?.message) {
+                    // Use adapter's method to edit the message
+                    await adapter.editMessageText(
+                        "I'm sorry, but I encountered an error while processing this question."
+                    );
+                }
+            }
+
+            return;
+        }
         if (data.startsWith('prev_question:') || data.startsWith('next_question:') || data.startsWith('select_question:')) {
             const [action, setId] = data.split(':');
             const key = this.getChatKey(context);
@@ -2415,10 +2782,11 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             }
 
         }
+        // In handleCallbackQuery
         else if (data.startsWith('pattern_')) {
             const methodName = 'handleCallbackQuery';
 
-            // Parse the command using a more reliable approach
+            // Parse the command using a more reliable approach that handles multiple parameters
             const match = data.match(/^pattern_([^:]+)(?::(.+))?$/);
             if (!match) {
                 console.warn(`[${methodName}] Invalid pattern command format:`, data);
@@ -2427,10 +2795,9 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             }
 
             const action = match[1]; // e.g., 'use', 'more', 'category', etc.
-            const parameter = match[2]; // e.g., the pattern name, category, etc.
+            const parameter = match[2]; // This might contain additional colons for nested parameters
 
-            console.log(`[${methodName}] Pattern action:`, action, 'parameter:', parameter);
-
+            console.log(`[${methodName}] Pattern action: ${action}, parameter: ${parameter}`);
             await this.commandHandler?.handlePatternAction(adapter, action, parameter);
             return;
         }
@@ -2465,9 +2832,139 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return;
         }
 
+        // In CommandHandler.ts, within your handleCallbackQuery method or similar
+
+        else if (data.startsWith('rumble_get:')) {
+            const methodName = 'handleCallbackQuery';
+            const match = data.match(/^rumble_get:([^:]+):(.+)$/);
+            if (!match) {
+                console.warn(`[${methodName}] Invalid Rumble command format:`, data);
+                await adapter.answerCallbackQuery('Invalid Rumble command');
+                return;
+            }
+
+            const videoId = match[1]; // e.g., 'v6qhrac'
+            const rumbleAction = match[2]; // e.g., 'transcript'
+            console.log(`[${methodName}] Rumble action: get, videoId: ${videoId}, rumbleAction: ${rumbleAction}`);
+
+            // Call the handler directly since we're in the CommandHandler class
+            await this.commandHandler.handleRumbleAction(adapter, videoId, rumbleAction);
+            return;
+        }
+        // After other callback handlers
+        else if (data.startsWith('standard_menu:')) {
+            const methodName = 'handleCallbackQuery';
+            // Parse the command using the same approach as pattern handler
+            const match = data.match(/^standard_menu:([^:]+)(?::(.+))?$/);
+            if (!match) {
+                console.warn(`[${methodName}] Invalid standard menu command format:`, data);
+                await adapter.answerCallbackQuery('Invalid menu command');
+                return;
+            }
+
+            const action = match[1]; // e.g., 'main', 'query', 'select_bot', 'settings'
+            const parameter = match[2]; // This might be a botId or other parameter
+            console.log(`[${methodName}] Standard menu action: ${action}, parameter: ${parameter}`);
+
+            // Ensure we have a commandHandler
+            if (!this.commandHandler) {
+                console.error(`[${methodName}] CommandHandler not available for standard menu action`);
+                await adapter.answerCallbackQuery('Menu system unavailable');
+                return;
+            }
+
+            // Call the appropriate handler method
+            try {
+                // Convert parameter to number if it's supposed to be a botId
+                const botId = parameter ? parseInt(parameter, 10) : undefined;
+
+                // Handle different standard menu actions
+                switch (action) {
+                    case 'main':
+                        if (botId && !isNaN(botId)) {
+                            await this.commandHandler.showCommandMenu(adapter, botId);
+                        } else {
+                            // Default to first bot if parameter is missing
+                            const defaultBotId = this.getAllBotInfo()[0]?.id;
+                            if (defaultBotId) {
+                                await this.commandHandler.showCommandMenu(adapter, defaultBotId);
+                            } else {
+                                await adapter.answerCallbackQuery('No bot available');
+                            }
+                        }
+                        break;
+
+                    case 'query':
+                        // Send a prompt asking for the query
+                        await adapter.reply(
+                            "What would you like to know? I'm ready to help!",
+                            { reply_markup: { force_reply: true } }
+                        );
+                        break;
+
+                    case 'select_bot':
+                        // Show bot selection menu
+                        if (this.commandHandler.menuManager) {
+                            const botInfo = this.getAllBotInfo();
+                            const keyboard = this.commandHandler.menuManager.createBotSelectionMenu(botInfo);
+                            await adapter.reply('Select a bot to interact with:', {
+                                reply_markup: keyboard.reply_markup
+                            });
+                        } else {
+                            await adapter.answerCallbackQuery('Bot selection unavailable');
+                        }
+                        break;
+
+                    case 'settings':
+                        // Create settings menu - define this method in CommandHandler
+                        if (botId && !isNaN(botId)) {
+                            await this.commandHandler.handleStandardMenuAction(adapter, 'settings', botId);
+                        } else {
+                            await adapter.answerCallbackQuery('Settings unavailable');
+                        }
+                        break;
+
+                    default:
+                        // Pass the action to the command handler's general handler if it exists
+                        if (typeof this.commandHandler.handleStandardMenuAction === 'function') {
+                            await this.commandHandler.handleStandardMenuAction(adapter, action, parseInt(parameter || '0'));
+                        } else {
+                            console.warn(`[${methodName}] Unknown standard menu action: ${action}`);
+                            await adapter.answerCallbackQuery('Unknown menu action');
+                        }
+                }
+            } catch (error) {
+                console.error(`[${methodName}] Error handling standard menu action:`, error);
+                await adapter.answerCallbackQuery('Error processing menu action');
+            }
+
+            return;
+        }
         else if (data.startsWith('thinking_')) {
             await this.commandHandler.handleThinkingCallback(adapter, data);
             return;
+        }
+        else if (data.startsWith('summary_')) {
+            const parts = data.split('_');
+            const action = parts[1];
+            const chatId = parts.length > 2 ? parts[2] : context.chatId.toString();
+
+            await adapter.answerCallbackQuery('Processing...');
+
+            if (action === 'generate') {
+                await this.handleSummaryGeneration(adapter, chatId);
+            } else if (action === 'cancel') {
+                await adapter.editMessageText('Summary generation cancelled.');
+
+                // Auto-delete after a short delay
+                setTimeout(async () => {
+                    try {
+                        await adapter.deleteMessage();
+                    } catch (e) {
+                        // Ignore deletion errors
+                    }
+                }, 5000);
+            }
         } else {
             console.warn('Received unknown callback query:', data);
             await adapter.answerCallbackQuery("I don't know how to handle this action.");
@@ -2479,6 +2976,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         adapter: ContextAdapter,
         conversationManager: ConversationManager,
         agentManager: AgentManager,
+        disablePatternSuggestion: boolean = false,
         interactionType?: InteractionType,
     ): Promise<string | FormattedResponse> { // Ensure return type is string
         const methodName = 'handleMessage';
@@ -2486,6 +2984,8 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         //console.log(methodName, ": Entering handleMessage");
         console.log('handleMessage: PromptManager state:', this.promptManager ? 'Initialized' : 'Not initialized');
         const context = adapter.getMessageContext();
+        const { sessionId } = await this.conversationManager!.getSessionInfo(context);
+
         console.log(`[${methodName}] Entering handleMessage with payload:`, {
             context: {
                 input: adapter.context,
@@ -2509,9 +3009,11 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
         const message = context.raw.message;
         const chatId = context.chatId;
-        if (message.text && await this.checkForYouTubeUrl(message.text, adapter)) {
-            return ''; // YouTube URL detected and handled, don't process further
+
+        if (message.text && await this.checkForMediaUrl(message.text, adapter)) {
+            return ''; // Media URL detected and handled, don't process further
         }
+
         // Get the botKey (chatflowId) from flowIdMap
         const flowIdEntry = Array.from(flowIdMap.entries())
             .find(([_, fId]) => fId === this.flowId);
@@ -2624,9 +3126,6 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return "Error: Sender ID is undefined";
         }
 
-
-
-
         const botUsername = this.bot.botInfo?.username;
         if (!botUsername) {
             console.error('Bot username is undefined');
@@ -2647,7 +3146,11 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 return "Times up buddy";
             }
         }
-
+        // Add this line to update user activity
+        const ragAgent = agentManager.getAgent('rag') as RAGAgent;
+        if (ragAgent) {
+            ragAgent.refreshUserActivity(userId);
+        }
         const chatType = context.raw.chat.type;
         const isPrivateChat = chatType === 'private';
         const isGroup = chatType === 'group' || chatType === 'supergroup';
@@ -2683,7 +3186,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return "";
         }
 
-        const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+        // const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
         const isRagModeEnabled = ragAgent.isRAGModeEnabled(userId.toString());
 
         let replyToMessage: { message_id: number; text: string } | undefined;
@@ -2706,15 +3209,107 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         }
 
         // Determine if we should process this message
-        let shouldProcess = isPrivateChat || text.includes(`@${botUsername}`) || isDirectedAtThisBot || (isGroup && isRagModeEnabled);
+        const isActiveConversation = this.isActiveConversation ?
+            this.isActiveConversation(chatId.toString()) :
+            false;
+
+        // Update shouldProcess to include active conversations
+        let shouldProcess = isPrivateChat ||
+            text.includes(`@${botUsername}`) ||
+            isDirectedAtThisBot ||
+            (isGroup && isRagModeEnabled) ||
+            (isGroup && isActiveConversation);
 
         if (!shouldProcess && isGroup) {
+            console.log(`[${methodName}] Not processing group message because:`, {
+                isPrivateChat,
+                includesBotUsername: text.includes(`@${botUsername}`),
+                isDirectedAtThisBot,
+                isRagModeEnabled,
+                isActiveConversation
+            });
             // Check if the message mentions this bot
             const botMentionRegex = new RegExp(`@${botUsername}\\b`, 'i');
             if (botMentionRegex.test(text)) {
                 isDirectedAtThisBot = true;
                 // Remove the bot mention from the text
                 text = text.replace(botMentionRegex, '').trim();
+            }
+            if (!disablePatternSuggestion && adapter.isTelegramMessage() && await this.conversationManager!.shouldSuggestPattern(context.input, 'statement', adapter.getMessageContext())) {
+                shouldProcess = true;
+            }
+            // Check if this matches question detection criteria
+            if (!shouldProcess && this.questionAnalyzer) {
+                try {
+                    const chatHistory = await this.getChatHistory(adapter);
+                    const groupMembers = await this.getGroupMembers(chatId);
+
+                    const analysis = await this.questionAnalyzer.analyzeQuestion(
+                        text,
+                        context,
+                        chatHistory,
+                        groupMembers
+                    );
+
+                    console.log(`[${methodName}] Question analysis:`, {
+                        isQuestion: analysis.isQuestion,
+                        confidence: analysis.confidence,
+                        recommendedAction: analysis.recommendedAction
+                    });
+
+                    // If it's a question we should offer help for, update shouldProcess
+                    if (analysis.isQuestion &&
+                        analysis.confidence > 0.7 &&
+                        analysis.recommendedAction === 'offer_help') {
+
+                        console.log(`[${methodName}] Offering help for question`);
+
+                        // Create an inline keyboard to offer help
+                        const keyboard = Markup.inlineKeyboard([
+                            [
+                                Markup.button.callback('Yes, please answer', `answer_question:${message.message_id}`),
+                                Markup.button.callback('No thanks', `ignore_question:${message.message_id}`)
+                            ]
+                        ]);
+
+                        // If RAG mode is recommended, mention it
+                        const ragMention = analysis.requiresRagMode ?
+                            "I can search our knowledge base for information on this." :
+                            "I can try to answer this from my general knowledge.";
+
+                        // Send the offer
+                        await adapter.reply(
+                            `I noticed a question. ${ragMention} Would you like me to answer?`,
+                            { replyToMessageId: message.message_id, reply_markup: keyboard.reply_markup }
+                        );
+
+                        // Store the question for later
+                        this.storeQuestionForLater(userId, sessionId, message.message_id, text, analysis, 'handleMessage');
+
+                        return "Question detection handled";
+                    }
+                    // In processMessage:
+                    else if (analysis.isQuestion &&
+                        analysis.confidence > 0.7 &&
+                        (analysis.recommendedAction === 'answer' || analysis.recommendedAction === 'continue_conversation')) {
+
+                        console.log(`[${methodName}] Analysis recommends answering directly, processing message`);
+
+                        // Set RAG mode if needed
+                        if (analysis.requiresRagMode) {
+                            const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                            if (ragAgent) {
+                                ragAgent.toggleRAGMode(userId, true);
+                                console.log(`[${methodName}] Enabled RAG mode based on analysis`);
+                            }
+                        }
+
+                        // Process the message directly
+                        shouldProcess = true;
+                    }
+                } catch (error) {
+                    console.error(`[${methodName}] Error in question analysis:`, error);
+                }
             }
         }
 
@@ -2762,6 +3357,8 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
                 if (sentConfirmation) {
                     await this.updateProgress(adapter, `${chatId}:${sentConfirmation.message_id}`, "✉️ Preparing to process your message...");
+                    console.log(`[${methodName}] Progress update for progressKey: ${progressKey}`);
+
                 }
 
                 let cleanedMessage = this.cleanMessage(context);
@@ -2822,6 +3419,8 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                     );
                     if (sentConfirmation) {
                         await this.updateProgress(adapter, `${chatId}:${sentConfirmation.message_id}`, "✔️Finalizing the response...💥");
+                        console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
+
                     }
 
                     console.log(`[${methodName}] AI response generated`);
@@ -2876,24 +3475,100 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         logInfo(methodName, `Received message`, { userId, sessionId, source: context.source, isAI, isReply });
 
 
-        // Type guards for different message types
+        // Extract userInput
         let userInput: string;
-
-        // Type guards for different message types
         if ('text' in message) {
             userInput = message.text;
-        } else if ('caption' in message && 'photo' in message) {
-            // Photo message with caption
-            userInput = message.caption || '';
-        } else if ('caption' in message && 'video' in message) {
-            // Video message with caption
-            userInput = message.caption || '';
-        } else if ('caption' in message && 'document' in message) {
-            // Document message with caption
+        } else if ('caption' in message && ('photo' in message || 'video' in message || 'document' in message)) {
             userInput = message.caption || '';
         } else {
             logWarn(methodName, 'Received message is not a text or caption-based message', { userId, sessionId });
             return 'Sorry, I can only process text messages or media with captions.';
+        }
+        // Initialize question analyzer if needed
+        if (!this.questionAnalyzer && this.utilityModel) {
+            this.initializeQuestionAnalyzer();
+        }
+
+        // Check if this is a group chat
+        const isGroupChat = context.raw?.chat?.type === 'group' || context.raw?.chat?.type === 'supergroup';
+        const chatId = context.chatId;
+
+        // Check for bot mention
+        const botUsername = this.bot?.botInfo?.username;
+        const isBotMentioned = botUsername ? userInput.includes(`@${botUsername}`) : false;
+
+        // Update conversation tracking for this user message
+        this.updateConversationTracking(adapter, false, isBotMentioned);
+
+        // For group chats, implement the question detection logic
+        // For group chats, implement the question detection logic with optimized analyzer
+        if (isGroupChat && !isReply && context.source === 'telegram' && this.questionAnalyzer) {
+            // Get group members
+            const groupMemberMap = await (typeof chatId === 'number' ?
+                this.getGroupMembers(chatId) :
+                this.getGroupMembers(parseInt(chatId.toString(), 10)));
+
+            // Check if message is explicitly directed at the bot
+            const isDirectedAtBot = isBotMentioned ||
+                (replyToMessage && this.isBotMessage(chatId, replyToMessage.message_id));
+
+            // Check if we're in an active conversation
+            const isActiveChat = this.isActiveConversation(chatId.toString());
+
+            if (!isDirectedAtBot && !isActiveChat) {
+                // Get chat history for context
+                const chatHistory = await this.getChatHistory(adapter);
+
+                // Use optimized progressive analysis
+                const analysis = await this.questionAnalyzer.analyzeQuestionProgressively(
+                    userInput,
+                    context,
+                    chatHistory,
+                    groupMemberMap
+                );
+
+                logInfo(methodName, 'Question analysis result', {
+                    isQuestion: analysis.isQuestion,
+                    confidence: analysis.confidence,
+                    action: analysis.recommendedAction
+                });
+
+                // Handle based on recommended action
+                if (analysis.recommendedAction === 'stay_silent') {
+                    // Just silently return
+                    logInfo(methodName, 'Detected question but staying silent', {
+                        reason: analysis.reasoning
+                    });
+                    return "Question detected but staying silent";
+                }
+                else if (analysis.recommendedAction === 'offer_help') {
+                    // Create an inline keyboard to offer help
+                    const keyboard = Markup.inlineKeyboard([
+                        [
+                            Markup.button.callback('Yes, please answer', `answer_question:${message.message_id}`),
+                            Markup.button.callback('No thanks', `ignore_question:${message.message_id}`)
+                        ]
+                    ]);
+
+                    // If RAG mode is recommended, mention it
+                    const ragMention = analysis.requiresRagMode ?
+                        "I can search our knowledge base for information on this." :
+                        "I can try to answer this from my general knowledge.";
+
+                    // Send the offer
+                    await adapter.reply(
+                        `I noticed a question. ${ragMention} Would you like me to answer?`,
+                        { replyToMessageId: message.message_id, reply_markup: keyboard.reply_markup }
+                    );
+
+                    // Store the question for later handling if they say "yes"
+                    this.storeQuestionForLater(userId, sessionId, message.message_id, userInput, analysis);
+
+                    // Return early - we'll handle the actual response when they click "Yes"
+                    return "Question detection handled";
+                }
+            }
         }
 
         logDebug(methodName, `Processed user input`, { userId, sessionId, userInput: userInput });
@@ -2916,21 +3591,25 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 await this.processAIMessage(adapter, userInput);
                 return "AI message processed successfully";
             } else {
-                const response = await this.prepareAndProcessUserInput(adapter, userInput, interactionType, progressKey);
-
+                const aiResponse = await this.prepareAndProcessUserInput(
+                    adapter,
+                    userInput,
+                    interactionType,
+                    progressKey
+                );
                 // Only update token usage for webapp source
                 if (context.source === 'webapp') {
                     // Update token usage with response text
-                    await this.accountManager.updateTokenUsageFromText(userId, response, context.source);
+                    await this.accountManager.updateTokenUsageFromText(userId, aiResponse, context.source);
 
                     logInfo(methodName, `Response processed:`, {
-                        responsePreview: response.substring(0, 100),
+                        responsePreview: aiResponse.substring(0, 100),
                         userId,
                         source: context.source
                     });
                 }
 
-                return response;
+                return aiResponse;
             }
         } catch (error) {
             logError(methodName, `Error processing message for user ${userId} in session ${sessionId}:`, error as Error);
@@ -2961,6 +3640,161 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             logInfo(methodName, `AI message processed`, { response: aiResponse });
             return aiResponse;
         } else {
+            // Get the question analysis if available (from pending questions or fresh analysis)
+            let questionAnalysis: QuestionAnalysisResult | null = null;
+            const isGroupChat = context.raw?.chat?.type === 'group' || context.raw?.chat?.type === 'supergroup';
+
+            if (isGroupChat) {
+                const originalMessageId = typeof context.raw?.message?.message_id === 'number' ?
+                    context.raw.message.message_id :
+                    (typeof context.messageId === 'number' ? context.messageId : 0);
+
+                // Define the cached question data type
+                interface CachedQuestionData {
+                    userId: string;
+                    sessionId: string;
+                    question: string;
+                    analysis: QuestionAnalysisResult;
+                    timestamp: number;
+                    source?: string; // Make source optional
+                }
+
+                // Check both caching mechanisms:
+                // 1. First try to get from pending questions (callback query)
+                const pendingCacheKey = `pending_question:${originalMessageId}`;
+                const pendingData = this.conversationManager?.cache.get<CachedQuestionData>(pendingCacheKey);
+
+                // 2. Then try to get from content-based cache
+                const contentCacheKey = `question_analysis:${Buffer.from(input).toString('base64').substring(0, 40)}`;
+                const contentData = this.conversationManager?.cache.get<{ result: QuestionAnalysisResult, timestamp: number }>(contentCacheKey);
+
+                // First check if we have pending data (priority)
+                if (pendingData && pendingData.analysis) {
+                    questionAnalysis = pendingData.analysis;
+                    logInfo(methodName, 'Using cached pending question analysis', {
+                        confidence: questionAnalysis.confidence,
+                        action: questionAnalysis.recommendedAction,
+                        source: pendingData.source || 'pending_cache',
+                        cacheAge: Math.round((Date.now() - pendingData.timestamp) / 1000) + 's'
+                    });
+
+                    // Remove from pending cache once we've processed it
+                    this.conversationManager?.cache.del(pendingCacheKey);
+                }
+                // Then check if we have recent content-based cache (less than 5 min old)
+                else if (contentData && contentData.result &&
+                    (Date.now() - contentData.timestamp < 5 * 60 * 1000)) {
+
+                    questionAnalysis = contentData.result;
+                    logInfo(methodName, 'Using cached content-based question analysis', {
+                        confidence: questionAnalysis.confidence,
+                        action: questionAnalysis.recommendedAction,
+                        source: 'content_cache',
+                        cacheAge: Math.round((Date.now() - contentData.timestamp) / 1000) + 's'
+                    });
+                }
+                // Finally, do a fresh analysis if needed
+                else {
+                    const botUsername = this.bot?.botInfo?.username;
+                    const isBotMentioned = botUsername ? input.includes(`@${botUsername}`) : false;
+                    const isDirectedAtBot = isBotMentioned || isReply;
+
+                    // Only do analysis if not explicitly directed at the bot
+                    if (!isDirectedAtBot) {
+                        try {
+                            const groupMembers = await this.getGroupMembers(
+                                typeof chatId === 'string' ? parseInt(chatId, 10) : chatId
+                            );
+
+                            questionAnalysis = await this.questionAnalyzer.analyzeQuestionProgressively(
+                                input,
+                                context,
+                                chatHistory,
+                                groupMembers
+                            );
+
+                            if (questionAnalysis) {
+                                logInfo(methodName, 'Performed fresh question analysis', {
+                                    confidence: questionAnalysis.confidence,
+                                    action: questionAnalysis.recommendedAction
+                                });
+
+                                // Cache the fresh analysis result in both systems
+                                // 1. Store in content cache for reuse
+                                this.conversationManager?.cache.set(contentCacheKey, {
+                                    result: questionAnalysis,
+                                    timestamp: Date.now()
+                                }, 5 * 60); // 5 minutes TTL
+
+                                logDebug(methodName, 'Cached fresh analysis in content cache', {
+                                    cacheKey: contentCacheKey,
+                                    expires: '5 minutes'
+                                });
+                            } else {
+                                logWarn(methodName, 'Question analysis returned null');
+                            }
+                        } catch (error) {
+                            logError(methodName, 'Error analyzing question', error as Error);
+                            // questionAnalysis remains null
+                        }
+                    }
+                }
+            }
+
+            // Handle RAG mode requirements regardless of analysis source
+            if (questionAnalysis?.requiresRagMode) {
+                const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                if (ragAgent) {
+                    ragAgent.toggleRAGMode(userId as string, true);
+                    logInfo(methodName, 'Enabled RAG mode based on question analysis', {
+                        userId: userId as string,
+                        confidence: questionAnalysis.confidence
+                    });
+                }
+            }
+
+            // Also check for explicit RAG mode request in message (works in any chat type)
+            if (input.toLowerCase().includes('ragmode') || input.toLowerCase().includes('rag mode')) {
+                const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                if (ragAgent) {
+                    ragAgent.toggleRAGMode(userId as string, true);
+                    logInfo(methodName, 'Enabled RAG mode based on explicit request in message', {
+                        userId: userId as string,
+                        trigger: input.includes('ragmode') ? 'ragmode' : 'rag mode'
+                    });
+                }
+            }
+
+            // Determine base interaction type
+            let detectedInteractionType = interactionType;
+            if (!detectedInteractionType) {
+                detectedInteractionType = await this.conversationManager!.determineInteractionType(input, userId as string);
+            }
+
+            // Determine base context requirement
+            let contextRequirement = await this.conversationManager!.detectContextRequirement(
+                input, detectedInteractionType, userId as string
+            );
+
+            // If we have question analysis, use it to adjust our detection
+            if (questionAnalysis) {
+                // Update interaction type and context requirement based on analysis
+                const { interactionType: updatedType, contextRequirement: updatedReq } =
+                    this.conversationManager!.updateInteractionFromQuestionAnalysis(
+                        questionAnalysis,
+                        detectedInteractionType,
+                        contextRequirement
+                    );
+
+                detectedInteractionType = updatedType;
+                contextRequirement = updatedReq;
+
+                logInfo(methodName, 'Adjusted interaction based on question analysis', {
+                    interactionType: detectedInteractionType,
+                    contextRequirement: contextRequirement
+                });
+            }
+
             console.log(`[${methodName}:${this.flowId}] Calling processUserInput`);
             const enhancedResponse = await this.processUserInput(
                 adapter,
@@ -2995,7 +3829,11 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         const methodName = 'processUserInput';
         const context = adapter.getMessageContext();
         const { userId, sessionId } = await this.conversationManager!.getSessionInfo(context);
-
+        // Update RAG activity
+        const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+        if (ragAgent) {
+            ragAgent.refreshUserActivity(userId);
+        }
         console.log(`[${methodName}:${this.flowId}] Starting for user input: "${input.substring(0, 50)}..."`);
         console.log(`[${methodName}:${this.flowId}] isAI: ${isAI}, isReply: ${isReply}, isFollowUp: ${isFollowUp}`);
 
@@ -3117,6 +3955,8 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         if (isRAGEnabled) {
             if (progressKey) {
                 await this.updateProgress(adapter, progressKey, "🖥 Generating with context...");
+                console.log(`[processNormalInteraction] Progress updated for progressKey: ${progressKey}`);
+
             }
 
             return await this.conversationManager!.processWithRAGAgent(
@@ -3131,6 +3971,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         } else {
             if (progressKey) {
                 await this.updateProgress(adapter, progressKey, "💭 Generating response...");
+                console.log(`[processNormalInteraction] Progress updated for progressKey: ${progressKey}`);
             }
 
             const response = await this.conversationManager!.generateResponse(
@@ -3252,6 +4093,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         const methodName = 'handleEnhancedResponse';
         const context = adapter.getMessageContext();
         const { userId, sessionId } = await this.conversationManager!.getSessionInfo(context);
+        const chatId = context.chatId;
 
         logInfo(methodName, `Processing enhanced response`, { userId, sessionId });
 
@@ -3288,6 +4130,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
                 return response.message_id;
             }
+
             // Check for pattern keyboard
             const patternKeyboard = this.conversationManager!.cache.get(`pattern_keyboard:${userId}`);
             if (patternKeyboard) {
@@ -3302,15 +4145,74 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                         reply_markup: patternKeyboard
                     }
                 );
+
+                // Store this response for future pattern processing
+                await this.storeResponseForPatterns(userId, enhancedResponse.response.join('\n'), sentMessage);
+
                 return sentMessage.message_id;
             }
-            // Handle non-game responses as before
+
+            // Handle non-game, non-pattern responses with standard menu
             if (progressKey && adapter) {
                 await this.updateProgress(adapter, progressKey, "💯 Enhanced Response ready to send...");
+                console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
             }
 
-            // Send the main response
-            const messageId = await this.sendResponse(adapter, enhancedResponse.response);
+            // Determine if we should add standard menu
+            // Don't add menu to very short responses, error messages, or if explicitly disabled
+            const responseText = enhancedResponse.response.join('\n');
+            const shouldAddMenu = responseText.length > 50 &&
+                !responseText.includes('Error:') &&
+                !responseText.startsWith('❌') &&
+                !enhancedResponse.skipStandardMenu;
+
+            // Get standard menu if needed
+            let replyMarkup = undefined;
+            if (shouldAddMenu && this.commandHandler && this.commandHandler.menuManager) {
+                const isGroupChat = adapter.getChatType() === 'group' || adapter.getChatType() === 'supergroup';
+                const botId = adapter.getBotInfo()?.id || this.botId;
+                const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                const isRagEnabled = ragAgent ? ragAgent.isRAGModeEnabled(userId) : false;
+
+
+                // Get the standard menu keyboard - add response context for menu generation
+                replyMarkup = this.commandHandler.menuManager.createStandardChatMenu(
+                    isGroupChat,
+                    botId!,
+                    {  // Add context information
+                        isResponse: true,
+                        hasContent: true,
+                        contentLength: responseText.length,
+                        isRagEnabled: isRagEnabled  // Pass the RAG status
+
+                    }
+                ).reply_markup;
+
+                console.log(`[${methodName}] Adding standard menu to response in ${isGroupChat ? 'group' : 'private'} chat`);
+            }
+
+            // Send the main response with standard menu if appropriate
+            const messageId = await this.sendResponseWithMenu(adapter, enhancedResponse.response, replyMarkup);
+
+            // Important: Store this response for future pattern processing
+            // Create a simulated message object for storage since we don't have the actual message object
+            const sentMessage = { message_id: messageId };
+            if (messageId) {
+                // Try to get context information if available
+                let relevantContext: string | undefined = undefined;
+
+                // Check the context cache directly
+                const contextCacheKey = `relevant_context:${userId}`;
+                const contextCacheEntry = this.conversationManager!.cache.get<{ relevantContext: string; timestamp: number }>(contextCacheKey);
+
+                if (contextCacheEntry?.relevantContext) {
+                    relevantContext = contextCacheEntry.relevantContext;
+                    console.log(`[${methodName}] Found cached context for storage, length: ${relevantContext.length}`);
+                }
+
+                // Store the response data with the context if available
+                await this.storeResponseForPatterns(userId, responseText, sentMessage, relevantContext);
+            }
 
             // Handle source citations - with null check
             if (enhancedResponse.sourceCitations && enhancedResponse.sourceCitations.length > 0) {
@@ -3321,6 +4223,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 });
                 if (progressKey && adapter) {
                     await this.updateProgress(adapter, progressKey, "📚 stacking source citations...");
+                    console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
                 }
                 await this.sendPaginatedCitations(adapter, enhancedResponse.sourceCitations);
             }
@@ -3334,6 +4237,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 });
                 if (progressKey && adapter) {
                     await this.updateProgress(adapter, progressKey, "📚 stacking follow-up questions...");
+                    console.log(`[${methodName}] Progress updated for progressKey: ${progressKey}`);
                 }
                 await this.sendPaginatedQuestions(adapter, enhancedResponse.followUpQuestions);
             }
@@ -3344,6 +4248,21 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 await adapter.reply(`🤖 An external agent might be able to assist further: ${enhancedResponse.externalAgentSuggestion}`);
             }
 
+            // After sending a message, record its ID
+            if (messageId) {
+                // Record this as a bot message
+                this.recordBotMessage(chatId, messageId);
+
+                // Update conversation tracking
+                this.updateConversationTracking(adapter, true);
+
+                logInfo(methodName, `Recorded bot message ID for tracking`, {
+                    chatId,
+                    messageId,
+                    responseType: enhancedResponse.gameMetadata ? 'game' : 'standard'
+                });
+            }
+
             return messageId;
         } catch (error) {
             logError(methodName, `Error processing enhanced response`, error as Error, { userId, sessionId });
@@ -3352,6 +4271,205 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         }
     }
 
+    /**
+     * Stores response data for later pattern processing
+     * @param userId The user ID
+     * @param responseText The full response text
+     * @param sentMessage The sent message object (for message ID)
+     */
+    /**
+ * Stores response data for later pattern processing
+ * @param userId The user ID
+ * @param responseText The full response text
+ * @param sentMessage The sent message object (for message ID)
+ * @param relevantContext Optional context used to generate the response
+ */
+    private async storeResponseForPatterns(
+        userId: string,
+        responseText: string,
+        sentMessage: any,
+        relevantContext?: string // Change parameter name for clarity
+    ): Promise<void> {
+        const methodName = 'storeResponseForPatterns';
+
+        try {
+            if (!this.conversationManager || !responseText || !sentMessage) {
+                console.warn(`[${methodName}] Missing required data, skipping storage`);
+                return;
+            }
+
+            // Store in pattern data cache
+            const patternDataKey = `pattern_data:${userId}`;
+            let patternData = this.conversationManager.cache.get<PatternData>(patternDataKey) || {
+                originalInput: '',
+                processedOutputs: {},
+                currentPatternState: {}
+            };
+
+            // Create response output object with proper type
+            const responseOutput: PatternData['processedOutputs']['latest_response'] = {
+                output: responseText,
+                timestamp: Date.now(),
+                messageIds: [sentMessage.message_id]
+            };
+
+            // Store the response as a special output type
+            patternData.processedOutputs['latest_response'] = responseOutput;
+
+            // Also update originalInput if it's empty or smaller than this response
+            // This ensures we have meaningful content for pattern processing
+            if (!patternData.originalInput || patternData.originalInput.length < responseText.length) {
+                patternData.originalInput = responseText;
+            }
+
+            // Initialize contextInfo if needed
+            if (!patternData.contextInfo) {
+                patternData.contextInfo = {};
+            }
+
+            // Get and store the relevant context if not provided
+            let contextToUse = relevantContext;
+            if (!contextToUse) {
+                try {
+                    // Try to get context from various cache keys
+                    const relevantContextKey = `relevant_context:${userId}`;
+                    const contextualizedQueryKey = `contextualized_query:${userId}`;
+
+                    const contextCacheEntry = this.conversationManager.cache.get(relevantContextKey);
+                    if (contextCacheEntry && typeof contextCacheEntry === 'object' && 'relevantContext' in contextCacheEntry) {
+                        contextToUse = contextCacheEntry.relevantContext as string;
+                    } else {
+                        // Try other keys if the first one doesn't work
+                        const otherContextEntries = [
+                            this.conversationManager.cache.get(`RelevantContext:${userId}`),
+                            this.conversationManager.cache.get(`context:${userId}`),
+                            this.conversationManager.cache.get(contextualizedQueryKey)
+                        ];
+
+                        for (const entry of otherContextEntries) {
+                            if (entry) {
+                                if (typeof entry === 'object' && 'relevantContext' in entry) {
+                                    contextToUse = entry.relevantContext as string;
+                                    break;
+                                } else if (typeof entry === 'string') {
+                                    contextToUse = entry;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (contextToUse) {
+                        console.log(`[${methodName}] Found context to use for source citations, length: ${contextToUse.length}`);
+
+                        // Store the context in pattern data
+                        patternData.contextInfo.relevantContext = contextToUse;
+                        patternData.contextInfo.lastUpdated = Date.now();
+
+                        // Also store it separately for redundancy
+                        this.conversationManager.cache.set(`response_context:${userId}`, contextToUse, 7200);
+                    }
+                } catch (contextError) {
+                    console.warn(`[${methodName}] Error getting context:`, contextError);
+                }
+            } else {
+                // Store the provided context
+                patternData.contextInfo.relevantContext = contextToUse;
+                patternData.contextInfo.lastUpdated = Date.now();
+            }
+
+            // Update the pattern data in cache
+            this.conversationManager.cache.set(patternDataKey, patternData, 7200);
+
+            // Store a compact context for pattern suggestions
+            const contextData: PatternContextData = {
+                input: responseText,
+                interactionType: 'general_input',
+                contextRequirement: 'chat',
+                timestamp: Date.now(),
+                originalMessageId: sentMessage.message_id,
+                currentPatternState: '',
+                metadata: {
+                    userId,
+                    messageId: sentMessage.message_id
+                }
+            };
+
+            this.conversationManager.cache.set(`pattern_context:${userId}`, contextData, 7200);
+
+            // Generate and store source citations if context is available
+            if (contextToUse && this.agentManager) {
+                try {
+                    const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+                    if (ragAgent && typeof (ragAgent as any).generateSourceCitations === 'function') {
+                        const sourceCitations = await (ragAgent as any).generateSourceCitations(contextToUse);
+
+                        if (sourceCitations && sourceCitations.length > 0) {
+                            console.log(`[${methodName}] Generated ${sourceCitations.length} source citations`);
+
+                            // Store citations in separate cache
+                            this.conversationManager.cache.set(
+                                `source_citations:${userId}:${sentMessage.message_id}`,
+                                sourceCitations,
+                                7200
+                            );
+
+                            // Also store in pattern data for easier access
+                            // We need to be careful about type safety here
+                            const typedOutput = patternData.processedOutputs['latest_response'];
+                            typedOutput.sourceCitations = sourceCitations;
+
+                            // Update pattern data again with the citations
+                            this.conversationManager.cache.set(patternDataKey, patternData, 7200);
+                        }
+                    }
+                } catch (citationError) {
+                    console.warn(`[${methodName}] Error generating source citations:`, citationError);
+                }
+            } else {
+                console.log(`[${methodName}] No context available for generating source citations`);
+            }
+
+            console.log(`[${methodName}] Successfully stored response (${responseText.length} chars) for user ${userId}`);
+        } catch (error) {
+            console.error(`[${methodName}] Error storing response data:`, error);
+            // Non-critical operation, so we log but don't throw
+        }
+    }
+    // NEW METHOD: Helper to send response with menu
+    private async sendResponseWithMenu(adapter: ContextAdapter, response: string | string[], replyMarkup?: any): Promise<number | undefined> {
+        const methodName = 'sendResponseWithMenu';
+        console.log(`[${methodName}:${this.flowId}:] Sending Response ${replyMarkup ? 'with menu' : 'without menu'}`);
+
+        const responseChunks = Array.isArray(response) ? response : this.promptManager!.splitAndTruncateMessage(response);
+        let lastMessageId: number | undefined;
+
+        for (let i = 0; i < responseChunks.length; i++) {
+            const chunk = responseChunks[i];
+            const isLastChunk = i === responseChunks.length - 1;
+
+            let formattedChunk: string;
+            if (adapter.getMessageContext().source === 'telegram') {
+                formattedChunk = FormatConverter.genericToHTML(chunk);
+            } else {
+                formattedChunk = FormatConverter.genericToMarkdown(chunk);
+            }
+
+            // Only add the menu to the last chunk
+            const markup = isLastChunk ? replyMarkup : undefined;
+
+            const sentMessage = await adapter.reply(formattedChunk, {
+                parse_mode: adapter.getMessageContext().source === 'telegram' ? 'HTML' : undefined,
+                reply_markup: markup
+            });
+
+            lastMessageId = sentMessage.message_id;
+
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        return lastMessageId;
+    }
 
     private async sendResponse(adapter: ContextAdapter, response: string | string[]): Promise<number | undefined> {
         const methodName = 'sendResponse';
@@ -3562,7 +4680,6 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         }
 
         // Handle keyboard menu options
-        // Handle keyboard menu options
         if (text.toLowerCase().includes('show commands') || text.toLowerCase().includes('show_commands')) {
             console.log('[handleSpecialCases] Processing show commands request');
             const botId = this.bot?.botInfo?.id;
@@ -3620,14 +4737,17 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                     console.error(`Error executing command ${commandName}:`, error);
                     await adapter.reply("I'm sorry, but I encountered an error while processing your command. Please try again later.");
                 }
+                return true;  // Return true only after handling a command
             } else {
                 console.error('CommandHandler is not initialized');
                 await adapter.reply("I'm sorry, but I'm not ready to process commands yet.");
+                return true;  // Return true for command failure too
             }
-            return true;
         }
 
-        return false;
+        // If we get here, no special cases were handled
+        console.log(`[${methodName}] No special cases detected, returning false`);
+        return false;  // Return false if no special cases were matched
     }
 
     private isCommandForThisBot(text: string, botUsername: string): boolean {
@@ -3637,12 +4757,16 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
     private async handleRagModeResponse(adapter: ContextAdapter, text: string): Promise<void> {
         const context = adapter.getMessageContext();
         const { userId } = await this.conversationManager!.getSessionInfo(context);
+        const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+
 
         this.conversationManager!.handleRagModeResponse(userId, text);
         let responseMessage: string;
         if (text.toLowerCase() === 'yes') {
+            ragAgent.toggleRAGMode(userId, false);
             responseMessage = "RAG mode has been disabled. You can re-enable it anytime with the /ragmode command.";
         } else {
+            ragAgent.refreshUserActivity(userId);
             responseMessage = "RAG mode remains enabled. Feel free to continue your conversation!";
         }
 
@@ -6113,18 +7237,30 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return null;
         }
     }
-    // Add this to your TelegramBot_Agents class
-    private youtubeUrlPattern = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|(?:s(?:horts)\/)|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]*)/;
 
     public async checkForYouTubeUrl(input: string, adapter: ContextAdapter): Promise<boolean> {
-        const match = input.match(this.youtubeUrlPattern);
-        if (!match || !match[1]) return false;
+        // Try multiple regex patterns to capture different YouTube URL formats
+        // Standard video pattern including shorts
+        const standardMatch = input.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:(?:watch\?v=)|(?:shorts\/)|(?:embed\/)|(?:v\/))|\S*?[?&]v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
 
-        const videoId = match[1];
-        console.log(`Detected YouTube video ID: ${videoId}`);
+        // Live URL pattern
+        const liveMatch = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/live\/)([a-zA-Z0-9_-]+)/i.exec(input);
+
+        // Determine videoId from either pattern
+        let videoId: string | null = null;
+
+        if (standardMatch && standardMatch[1]) {
+            videoId = standardMatch[1];
+            console.log(`Detected standard YouTube video ID: ${videoId}`);
+        } else if (liveMatch && liveMatch[1]) {
+            videoId = liveMatch[1];
+            console.log(`Detected YouTube live video ID: ${videoId}`);
+        }
+
+        if (!videoId) return false;
 
         try {
-            // Show action menu for YouTube video
+            // Show action menu for YouTube video with the original button layout
             await adapter.reply("🎬 I noticed a YouTube video link! Would you like me to retrieve data from this video?", {
                 reply_markup: {
                     inline_keyboard: [
@@ -6146,6 +7282,89 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return false;
         }
     }
+
+    // In TelegramBot_Agents.ts
+
+    /**
+     * Checks if a message contains a Rumble URL and offers extraction options
+     */
+    public async checkForRumbleUrl(input: string, adapter: ContextAdapter): Promise<boolean> {
+        // Rumble URL patterns
+        const standardMatch = input.match(/(?:https?:\/\/)?(?:www\.)?rumble\.com\/([a-zA-Z0-9]{6,})-[\w-]+\.html/i);
+        const embedMatch = input.match(/(?:https?:\/\/)?(?:www\.)?rumble\.com\/embed\/([a-zA-Z0-9]{6,})/i);
+
+        // Determine videoId from either pattern
+        let videoId: string | null = null;
+
+        if (standardMatch && standardMatch[1]) {
+            videoId = standardMatch[1];
+            console.log(`Detected standard Rumble video ID: ${videoId}`);
+        } else if (embedMatch && embedMatch[1]) {
+            videoId = embedMatch[1];
+            console.log(`Detected embedded Rumble video ID: ${videoId}`);
+        }
+
+        if (!videoId) return false;
+
+        try {
+            // Show action menu for Rumble video
+            await adapter.reply("🎬 I noticed a Rumble video link! Would you like me to retrieve data from this video?", {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: "📝 Get Transcript", callback_data: `rumble_get:${videoId}:transcript` },
+                            { text: "ℹ️ Get Video Info", callback_data: `rumble_get:${videoId}:metadata` }
+                        ],
+                        [
+                            { text: "💬 Get Comments", callback_data: `rumble_get:${videoId}:comments` }
+                        ]
+                    ]
+                }
+            });
+
+            return true; // URL was detected and handled
+        } catch (error) {
+            console.error("Error handling Rumble URL:", error);
+            return false;
+        }
+    }
+
+    /**
+     * Checks if a message contains any recognized media URL
+     */
+    private async checkForMediaUrl(input: string, adapter: ContextAdapter): Promise<boolean> {
+        // Check for YouTube URLs
+        if (await this.checkForYouTubeUrl(input, adapter)) {
+            return true;
+        }
+
+        // Check for Rumble URLs
+        if (await this.checkForRumbleUrl(input, adapter)) {
+            return true;
+        }
+
+        // Add more media platforms here as needed
+
+        return false; // No recognized media URLs found
+    }
+
+    private async checkYtDlpAvailability(): Promise<boolean> {
+        try {
+            const result = await execAsync('yt-dlp --version');
+            console.log(`yt-dlp version: ${result.stdout.trim()}`);
+            return true;
+        } catch (error) {
+            console.warn(`yt-dlp not found: ${error.message}`);
+            return false;
+        }
+    }
+    /**
+ * Sends a document to a chat
+ * @param chatId Unique identifier for the target chat
+ * @param document Document to send (file path or InputFile object)
+ * @param options Additional options for the document
+ */
+
     private sanitizeMessageContent(content: string): string {
         if (!content) return '';
 
@@ -6202,8 +7421,553 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             return content.trim();
         }
     }
+    /**
+     * Generates follow-up question suggestions for the current response
+     * @param adapter The context adapter
+     * @param botId The current bot ID
+     */
+    public async generateFollowUpSuggestions(adapter: ContextAdapter, botId: number): Promise<void> {
+        const methodName = 'generateFollowUpSuggestions';
 
 
+        try {
+
+            const context = adapter.getMessageContext();
+            const { userId, sessionId } = await this.conversationManager!.getSessionInfo(context);
+            const chatId = context.chatId.toString();
+            await adapter.safeAnswerCallbackQuery('Generating follow-up questions...');
+
+            // Get chat history for context
+            const chatHistoryResult = await this.memory!.getChatMessagesExtended(userId, sessionId);
+            const chatHistory = this.commandHandler.convertToChatHistory(chatHistoryResult);
+
+            // Get latest response content - first check pattern data cache
+            const patternData = this.conversationManager!.cache.get<PatternData>(`pattern_data:${userId}`);
+            let relevantContext = '';
+
+            // If we have latest_response in pattern data, use that
+            if (patternData?.processedOutputs?.latest_response?.output) {
+                relevantContext = patternData.processedOutputs.latest_response.output;
+                console.log(`[${methodName}] Using latest_response from pattern data, length: ${relevantContext.length}`);
+            }
+            // Otherwise, try to get context from RAG cache
+            else {
+                const contextCacheKey = `relevant_context:${userId}`;
+                const contextCacheEntry = this.conversationManager!.cache.get<{ relevantContext: string; timestamp: number }>(contextCacheKey);
+
+                if (contextCacheEntry?.relevantContext) {
+                    relevantContext = contextCacheEntry.relevantContext;
+                    console.log(`[${methodName}] Using context from RAG cache, length: ${relevantContext.length}`);
+                }
+            }
+
+            if (!relevantContext) {
+                console.warn(`[${methodName}] No relevant context found for generating follow-up questions`);
+                await adapter.reply("I don't have enough context to generate meaningful follow-up questions.");
+                return;
+            }
+
+            // Generate follow-up questions
+            const followUpQuestions = await this.conversationManager!.generateFollowUpQuestions(
+                relevantContext,
+                chatHistory,
+                true // Enhanced mode with more questions
+            );
+
+            if (!followUpQuestions || followUpQuestions.length === 0) {
+                await adapter.reply("I couldn't generate relevant follow-up questions based on our conversation.");
+                return;
+            }
+
+            // Use the existing pagination system
+            // Generate a unique ID for this question set
+            const setId = `followup_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+            // Store the questions using the existing userQuestionSets structure
+            const key = this.getChatKey(context);
+            if (!this.userQuestionSets.has(key)) {
+                this.userQuestionSets.set(key, new Map());
+            }
+
+            const questionSets = this.userQuestionSets.get(key)!;
+
+            // Create question data structure
+            const questionData: UserQuestionData = {
+                questions: followUpQuestions,
+                currentPage: 0,
+                lastActionTime: Date.now(),
+                setId,
+                expirationTime: Date.now() + 30 * 60 * 1000, // 30 minutes expiration
+                messageId: 0, // Will be set after sending
+                chatId: typeof context.chatId === 'number' ? context.chatId : parseInt(context.chatId.toString())
+            };
+
+            // Store the question set
+            questionSets.set(setId, questionData);
+
+            // Send the paginated questions using the existing method
+            await this.sendPaginatedQuestion(adapter, questionData, true);
+
+            console.log(`[${methodName}] Generated and sent ${followUpQuestions.length} follow-up questions for user ${userId}`);
+        } catch (error) {
+            console.error(`[${methodName}] Error:`, error);
+            await adapter.safeAnswerCallbackQuery('Error generating follow-up questions');
+            await adapter.reply("Sorry, I encountered an error while generating follow-up questions.");
+        }
+    }
+
+    /**
+   * Handles showing source citations on demand
+   * @param adapter The context adapter
+   * @param botId The current bot ID
+   */
+    public async showSourceCitations(adapter: ContextAdapter, botId: number): Promise<void> {
+        const methodName = 'showSourceCitations';
+
+        try {
+            const context = adapter.getMessageContext();
+            const { userId, sessionId } = await this.conversationManager!.getSessionInfo(adapter);
+
+            await adapter.safeAnswerCallbackQuery('Retrieving source citations...');
+
+            // Try multiple strategies to find relevant context
+            let relevantContext: string | undefined;
+            let rawDocs: ScoredDocument[] | undefined;
+
+            // First try to get raw docs
+            const rawDocsCache = this.conversationManager!.cache.get<{
+                documents: ScoredDocument[];
+                timestamp: number;
+            }>(`raw_docs:${this.conversationManager!.flowId}`);
+
+            if (rawDocsCache?.documents && rawDocsCache.documents.length > 0) {
+                console.log(`[${methodName}] Found ${rawDocsCache.documents.length} raw docs in cache`);
+                rawDocs = rawDocsCache.documents;
+
+                // Format these documents into the expected format for generateSourceCitations
+                relevantContext = rawDocsCache.documents
+                    .filter(doc => doc.score > 0)
+                    .sort((a, b) => b.score - a.score)
+                    .map(doc => {
+                        return `[Relevance: ${doc.score.toFixed(3)}]\n${doc.content}\n--- Metadata: ${JSON.stringify(doc.metadata)}`;
+                    })
+                    .join("\n\n");
+            } else {
+                // Fall back to the standard context cache
+                const contextCacheKey = `relevant_context:${userId}`;
+                const contextCacheEntry = this.conversationManager!.cache.get<{ relevantContext: string; timestamp: number }>(contextCacheKey);
+
+                if (contextCacheEntry?.relevantContext) {
+                    console.log(`[${methodName}] Found relevant context in cache, length: ${contextCacheEntry.relevantContext.length}`);
+                    relevantContext = contextCacheEntry.relevantContext;
+                } else {
+                    console.log(`[${methodName}] No relevant context or raw docs found in cache`);
+                }
+            }
+
+            // If we don't have context, we can't generate citations
+            if (!relevantContext) {
+                console.warn(`[${methodName}] No relevant context found for generating citations`);
+                await adapter.reply("I don't have source information to cite for this response.");
+                return;
+            }
+
+            // Get the RAG agent to generate citations
+            const ragAgent = this.agentManager!.getAgent('rag') as RAGAgent;
+            if (!ragAgent) {
+                console.warn(`[${methodName}] RAG agent not available`);
+                await adapter.reply("Source citations are not available at this time.");
+                return;
+            }
+
+            // Generate citations using the RAG agent's method
+            let sourceCitations: SourceCitation[] = [];
+
+            try {
+                if (rawDocs && typeof (ragAgent as any).generateSourceCitationsFromDocs === 'function') {
+                    // Use the raw docs directly if available and the agent supports it
+                    console.log(`[${methodName}] Generating citations directly from ${rawDocs.length} raw docs`);
+                    sourceCitations = await (ragAgent as any).generateSourceCitationsFromDocs(rawDocs);
+                } else if (typeof (ragAgent as any).generateSourceCitations === 'function') {
+                    // Otherwise use the formatted context
+                    console.log(`[${methodName}] Generating citations from formatted context, length: ${relevantContext.length}`);
+                    sourceCitations = await (ragAgent as any).generateSourceCitations(relevantContext);
+                } else {
+                    console.warn(`[${methodName}] No citation generation method available in RAG agent`);
+                    await adapter.reply("Source citation generation is not available.");
+                    return;
+                }
+
+                console.log(`[${methodName}] Generated ${sourceCitations.length} source citations`);
+            } catch (error) {
+                console.error(`[${methodName}] Error generating citations:`, error);
+                await adapter.reply("I encountered an error while generating source citations.");
+                return;
+            }
+
+            if (!sourceCitations || sourceCitations.length === 0) {
+                await adapter.reply("I couldn't find any relevant source citations for this response.");
+                return;
+            }
+
+            // Use the existing sendPaginatedCitations method to display citations
+            await this.sendPaginatedCitations(adapter, sourceCitations);
+
+            console.log(`[${methodName}] Successfully sent ${sourceCitations.length} paginated citations for user ${userId}`);
+        } catch (error) {
+            console.error(`[${methodName}] Error:`, error);
+            await adapter.safeAnswerCallbackQuery('Error retrieving source citations');
+            await adapter.reply("Sorry, I encountered an error while retrieving source citations.");
+        }
+    }
+    /**
+   * Stores a question for later processing when the user confirms they want an answer
+   * @param userId The user ID
+   * @param sessionId The session ID
+   * @param messageId The message ID of the question
+   * @param question The question text
+   * @param analysis The question analysis result
+   * @param source The source of the request (which method called this)
+   */
+    private storeQuestionForLater(
+        userId: string,
+        sessionId: string,
+        messageId: number,
+        question: string,
+        analysis: QuestionAnalysisResult,
+        source: 'handleMessage' | 'processMessage' = 'handleMessage'
+    ): void {
+        const methodName = 'storeQuestionForLater';
+
+        if (!this.conversationManager) {
+            logError(methodName, 'ConversationManager not available', '');
+            return;
+        }
+
+        // Define the type for cached question data
+        interface CachedQuestionData {
+            userId: string;
+            sessionId: string;
+            question: string;
+            analysis: QuestionAnalysisResult;
+            timestamp: number;
+            source?: string; // Make source optional
+        }
+
+        // Create a cache key
+        const cacheKey = `pending_question:${messageId}`;
+
+        // Store for 30 minutes
+        const cacheData: CachedQuestionData = {
+            userId,
+            sessionId,
+            question,
+            analysis,
+            timestamp: Date.now(),
+            source
+        };
+
+        this.conversationManager.cache.set(cacheKey, cacheData, 30 * 60); // 30 minutes TTL
+
+        // Also store in content-based cache for potential reuse
+        const contentCacheKey = `question_analysis:${Buffer.from(question).toString('base64').substring(0, 40)}`;
+        this.conversationManager.cache.set(contentCacheKey, {
+            result: analysis,
+            timestamp: Date.now()
+        }, 5 * 60); // 5 minutes TTL
+
+        logInfo(methodName, `Stored question for later processing`, {
+            messageId,
+            question: question.substring(0, 50) + (question.length > 50 ? '...' : ''),
+            requiresRag: analysis.requiresRagMode,
+            source
+        });
+    }
+
+
+    /**
+ * Records a message sent by the bot
+ * @param chatId The chat where the message was sent
+ * @param messageId The ID of the message
+ */
+    private recordBotMessage(chatId: string | number, messageId: number): void {
+        const chatKey = chatId.toString();
+
+        if (!this.botMessageRegistry.has(chatKey)) {
+            this.botMessageRegistry.set(chatKey, new Set());
+        }
+
+        const chatMessages = this.botMessageRegistry.get(chatKey)!;
+        chatMessages.add(messageId);
+
+        // Limit the size of the set to prevent memory issues
+        if (chatMessages.size > this.MESSAGE_HISTORY_LIMIT) {
+            // Remove oldest entries - since Sets don't track order, we'll just take a portion
+            const messagesToKeep = Array.from(chatMessages).slice(-Math.floor(this.MESSAGE_HISTORY_LIMIT * 0.8));
+            this.botMessageRegistry.set(chatKey, new Set(messagesToKeep));
+        }
+
+        logDebug('recordBotMessage', `Recorded bot message ${messageId} in chat ${chatKey}`);
+    }
+
+    /**
+     * Checks if a message was sent by this bot
+     * @param chatId The chat to check
+     * @param messageId The message ID to check
+     * @returns True if the message was sent by this bot
+     */
+    private isBotMessage(chatId: string | number, messageId: number): boolean {
+        const chatKey = chatId.toString();
+        const chatMessages = this.botMessageRegistry.get(chatKey);
+
+        if (!chatMessages) {
+            return false;
+        }
+
+        return chatMessages.has(messageId);
+    }
+
+    /**
+  * Initializes the bot message registry from conversation history
+  */
+    private async initializeMessageRegistry(): Promise<void> {
+        const methodName = 'initializeMessageRegistry';
+        logInfo(methodName, 'Initializing bot message registry');
+
+        try {
+            // Attempt to restore from memory if available
+            if (this.memory && typeof this.memory.getChatMessagesExtended === 'function' && this.databaseService) {
+                // Get active sessions
+                const activeSessions = await this.databaseService.getActiveSessions(100);
+
+                for (const session of activeSessions) {
+                    try {
+                        const userId = session.userId;
+                        const sessionId = session.id;
+                        const chatId = session.chat_id;
+
+                        if (!userId || !sessionId || !chatId) continue;
+
+                        // Get chat messages
+                        const messages = await this.memory.getChatMessagesExtended(userId, sessionId);
+
+                        // Find bot messages - need to handle both types
+                        const botMessages = messages.filter(msg => {
+                            // For ExtendedIMessage
+                            if ('type' in msg && msg.type === 'apiMessage') {
+                                return true;
+                            }
+                            // For BaseMessage
+                            if ('_getType' in msg && typeof msg.getType === 'function') {
+                                return msg.getType() === 'ai';
+                            }
+                            return false;
+                        });
+
+                        // Record message IDs
+                        for (const msg of botMessages) {
+                            // Fix the type checking for messageId
+                            if ('additional_kwargs' in msg && msg.additional_kwargs?.message_id) {
+                                const messageIdValue = msg.additional_kwargs.message_id;
+                                // Ensure messageId is a number
+                                if (typeof messageIdValue === 'number') {
+                                    this.recordBotMessage(chatId, messageIdValue);
+                                } else if (typeof messageIdValue === 'string') {
+                                    const parsedId = parseInt(messageIdValue, 10);
+                                    if (!isNaN(parsedId)) {
+                                        this.recordBotMessage(chatId, parsedId);
+                                    }
+                                }
+                            }
+                        }
+
+                        logInfo(methodName, `Initialized ${botMessages.length} bot messages for chat ${chatId}`);
+                    } catch (error) {
+                        logError(methodName, `Error initializing message registry for session ${session.id}`, error as Error);
+                        // Continue with next session
+                    }
+                }
+            }
+        } catch (error) {
+            logError(methodName, 'Error initializing message registry', error as Error);
+        }
+    }
+    // Add to TelegramBot_Agents.ts
+
+    /**
+ * Schedules periodic cleanup tasks
+ */
+    private setupCleanupTasks(): void {
+        // Every 10 minutes, clean up expired conversations
+        setInterval(() => {
+            // Add a null check before accessing questionAnalyzer
+            if (this.questionAnalyzer) {
+                try {
+                    this.questionAnalyzer.cleanupExpiredConversations();
+                    console.log(`[FlowID: ${this.flowId}] Cleaned up expired conversations`);
+                } catch (error) {
+                    console.error(`[FlowID: ${this.flowId}] Error cleaning up conversations:`, error);
+                }
+            } else {
+                // Log that questionAnalyzer is not available yet
+                console.log(`[FlowID: ${this.flowId}] Skipping conversation cleanup - questionAnalyzer not initialized`);
+            }
+
+            // Clean up message registry to prevent memory leaks
+            try {
+                // Also check if this method exists before calling it
+                if (typeof this.cleanupMessageRegistry === 'function') {
+                    this.cleanupMessageRegistry();
+                    console.log(`[FlowID: ${this.flowId}] Cleaned up message registry`);
+                }
+            } catch (error) {
+                console.error(`[FlowID: ${this.flowId}] Error cleaning up message registry:`, error);
+            }
+        }, 10 * 60 * 1000); // 10 minutes
+    }
+
+    /**
+     * Cleans up old message registry entries
+     */
+    private cleanupMessageRegistry(): void {
+        // Keep only last 100 messages per chat, or messages from last 24 hours
+        const now = Date.now();
+        const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+
+        for (const [chatId, messageIds] of this.botMessageRegistry.entries()) {
+            if (messageIds.size > 100) {
+                const messagesToKeep = Array.from(messageIds).slice(-100);
+                this.botMessageRegistry.set(chatId, new Set(messagesToKeep));
+            }
+        }
+    }
+    // In TelegramBot_Agents.ts:
+    public configureRagMode(options: { inactivityTimeout?: number }): void {
+        const ragAgent = this.agentManager.getAgent('rag') as RAGAgent;
+        if (!ragAgent) {
+            console.warn('RAG Agent not available for configuration');
+            return;
+        }
+
+        if (options.inactivityTimeout) {
+            ragAgent.setInactivityTimeout(options.inactivityTimeout);
+        }
+    }
+
+    // Add this method to TelegramBot_Agents class
+
+    /**
+     * Suggests a conversation summary when appropriate
+     * Called periodically during user interactions
+     */
+    private async checkAndSuggestSummary(adapter: ContextAdapter): Promise<void> {
+        const methodName = 'checkAndSuggestSummary';
+        const context = adapter.getMessageContext();
+        const chatId = context.chatId.toString();
+
+        // Only applies to group chats
+        if (context.raw?.chat?.type !== 'group' && context.raw?.chat?.type !== 'supergroup') {
+            return;
+        }
+
+        // Get the QuestionAnalyzer
+        if (!this.questionAnalyzer) {
+            return;
+        }
+
+        try {
+            // Get chat history
+            const chatHistory = await this.getChatHistory(adapter);
+
+            // Check if summary should be suggested
+            if (this.questionAnalyzer.shouldSuggestSummary(chatId, chatHistory.length)) {
+                logInfo(methodName, 'Suggesting conversation summary', {
+                    chatId,
+                    messageCount: chatHistory.length
+                });
+
+                // Create an inline keyboard with summary options
+                const keyboard = Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('✅ Generate Summary', `summary_generate:${chatId}`),
+                        Markup.button.callback('❌ No Thanks', `summary_cancel:${chatId}`)
+                    ]
+                ]);
+
+                // Send the suggestion
+                await adapter.reply(
+                    "I've noticed this conversation has been going for a while. Would you like me to generate a summary of the key points discussed?",
+                    { reply_markup: keyboard.reply_markup }
+                );
+
+                // Store summary suggestion state to avoid repeated offers
+                this.conversationManager!.cache.set(`summary_suggested:${chatId}`, Date.now(), 3600); // Don't suggest again for 1 hour
+            }
+        }
+        catch (error) {
+            logError(methodName, 'Error checking for summary suggestion', error as Error);
+        }
+    }
+
+    /**
+ * Handles the generation of a conversation summary
+ */
+    private async handleSummaryGeneration(adapter: ContextAdapter, chatId: string): Promise<void> {
+        const methodName = 'handleSummaryGeneration';
+
+        try {
+            // Update message to show progress
+            await adapter.editMessageText('🔄 Analyzing conversation and generating summary...');
+
+            // Get chat history
+            const chatHistory = await this.getChatHistory(adapter);
+
+            if (!this.questionAnalyzer) {
+                await adapter.editMessageText('Summary generation is currently unavailable.');
+                return;
+            }
+
+            // Generate the summary
+            const summary = await this.questionAnalyzer.generateGroupChatSummary(
+                chatId,
+                chatHistory,
+                true // Force new summary
+            );
+
+            if (!summary) {
+                await adapter.editMessageText("I'm sorry, but I couldn't generate a summary at this time. Please try again later.");
+                return;
+            }
+
+            // Format the summary with some structure and styling
+            const formattedSummary = `📝 **Conversation Summary**\n\n${summary}\n\n_Summary generated at ${new Date().toLocaleString()}_`;
+
+            // Send the formatted summary as a new message for better visibility
+            await adapter.reply(formattedSummary, { parse_mode: 'Markdown' });
+
+            // Update original message
+            await adapter.editMessageText('Summary generated and displayed below. ✅');
+
+            // Clean up after a short delay
+            setTimeout(async () => {
+                try {
+                    await adapter.deleteMessage();
+                } catch (error) {
+                    // Ignore deletion errors
+                }
+            }, 5000);
+
+            logInfo(methodName, 'Generated and sent conversation summary', {
+                chatId,
+                messageCount: chatHistory.length,
+                summaryLength: summary.length
+            });
+        }
+        catch (error) {
+            logError(methodName, 'Error generating conversation summary', error as Error);
+            await adapter.editMessageText("I encountered an error while generating the summary. Please try again later.");
+        }
+    }
 }
 
 class SimpleInMemoryRetriever extends BaseRetriever {

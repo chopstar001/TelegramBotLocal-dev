@@ -1270,9 +1270,9 @@ export class ConversationManager {
                 console.log(`[${methodName}] Retrieved contextualizedQuery from cache with key: "${queryCacheKey}".`);
             }
 
-            if (this.enablePersona) {
-                systemPrompt = `${systemPrompt}\n\n${this.promptManager.getPersonaPrompt()}`;
-            }
+          //  if (this.enablePersona) {
+          //     systemPrompt = `${systemPrompt}\n\n${this.promptManager.getPersonaPrompt()}`;
+         //   }
             if (progressKey && adapter) {
                 console.log(`[${methodName}:${this.flowId}] Updating progress: Preparing response`);
                 await this.updateProgress(adapter, progressKey, "📚");
@@ -3463,6 +3463,10 @@ export class ConversationManager {
         interactionType: InteractionType,
         context: MessageContext
     ): Promise<boolean> {
+        const methodName = 'shouldSuggestPattern';
+
+        console.warn(`[${methodName}] Entered shouldSuggestPattern`);
+
         // Enhance file detection to be more specific
         const hasFile = context.raw.message ? (
             'document' in context.raw.message ||

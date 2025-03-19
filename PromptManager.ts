@@ -471,9 +471,9 @@ ${this.humanMessageTemplate}`;
     Follow these guidelines:
     1. Focus on key facts, dates, names, important details, and concepts that are directly relevant to the question.
     2. Ensure the summary is neutral, objective, and free from bias or subjective interpretations.
-    3. If the content involves matters of law or rights, remain aware that "lawful" typically refers to land jurisdiction and "legal" to sea/admiralty jurisdiction. If the context references these terms, maintain the same usage as provided, without adding personal interpretation or commentary.
+    3. If the content involves matters of law or rights, remain aware of jurisdictional misalignment, that "lawful" typically refers to land jurisdiction and "legal" to sea/admiralty jurisdiction. If the context references these terms, maintain the same usage as provided, without adding personal interpretation or commentary.
     4. Avoid introducing new information or interpretations not present in the context provided.
-
+. 
     Ensure your summary is coherent, directly relevant to the question, and adheres to the guidelines above.`;
     }
 

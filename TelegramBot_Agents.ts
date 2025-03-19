@@ -628,6 +628,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
             // Initialize QuestionAnalyzer
             if (this.utilityModel) {
                 this.questionAnalyzer = new QuestionAnalyzer(
+                    this.conversationManager,
                     this.utilityModel,
                     this.summationModel,
                     this.chatModel,
@@ -1081,6 +1082,7 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
         // Initialize QuestionAnalyzer with all required models
         if (this.utilityModel && this.summationModel && this.chatModel && this.SpModel) {
             this.questionAnalyzer = new QuestionAnalyzer(
+                this.conversationManager,
                 this.utilityModel,
                 this.summationModel,
                 this.chatModel,
@@ -2940,6 +2942,36 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
 
             return;
         }
+        // In TelegramBot_Agents.ts handleCallbackQuery method:
+        else if (data.startsWith('ts_')) {
+            const methodName = 'handleCallbackQuery';
+            const match = data.match(/^ts_([^:]+)(?::(\d+)(?::(.+))?)?$/);
+            if (!match) {
+                console.warn(`[${methodName}] Invalid Transcription Settings format:`, data);
+                await adapter.answerCallbackQuery('Invalid Transcription Settings command');
+                return;
+            }
+
+            const action = match[1]; // e.g., 'provider', 'model', 'lang', etc.
+            const botId = match[2] ? parseInt(match[2]) : undefined;
+            const value = match[3]; // e.g., 'local-cuda', 'medium', 'en', etc.
+
+            // Verify it's meant for this bot
+            if (botId !== this.bot?.botInfo?.id) {
+                await adapter.answerCallbackQuery('Not for this bot');
+                return;
+            }
+
+            console.log(`[${methodName}] Transcription Settings: action=${action}, value=${value}`);
+
+            // Make sure CommandHandler is available
+            if (this.commandHandler) {
+                await this.commandHandler.handleTranscriptionSettingsAction(adapter, action, value);
+            } else {
+                await adapter.reply("Sorry, the Transcription Settings feature is not available right now.");
+            }
+            return;
+        }
         else if (data.startsWith('thinking_')) {
             await this.commandHandler.handleThinkingCallback(adapter, data);
             return;
@@ -3234,9 +3266,6 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
                 isDirectedAtThisBot = true;
                 // Remove the bot mention from the text
                 text = text.replace(botMentionRegex, '').trim();
-            }
-            if (!disablePatternSuggestion && adapter.isTelegramMessage() && await this.conversationManager!.shouldSuggestPattern(context.input, 'statement', adapter.getMessageContext())) {
-                shouldProcess = true;
             }
             // Check if this matches question detection criteria
             if (!shouldProcess && this.questionAnalyzer) {
@@ -7289,39 +7318,81 @@ export class TelegramBot_Agents implements INode, IUpdateMemory {
      * Checks if a message contains a Rumble URL and offers extraction options
      */
     public async checkForRumbleUrl(input: string, adapter: ContextAdapter): Promise<boolean> {
-        // Rumble URL patterns
-        const standardMatch = input.match(/(?:https?:\/\/)?(?:www\.)?rumble\.com\/([a-zA-Z0-9]{6,})-[\w-]+\.html/i);
-        const embedMatch = input.match(/(?:https?:\/\/)?(?:www\.)?rumble\.com\/embed\/([a-zA-Z0-9]{6,})/i);
-
-        // Determine videoId from either pattern
+        // Enhanced Rumble URL patterns
+        const patterns = [
+            // Standard URL format: v{alphanumeric}-title.html
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/v([a-zA-Z0-9]{5,})-[\w\.-]+\.html/i,
+            
+            // Embed URL format
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/embed\/([a-zA-Z0-9]{5,})/i,
+            
+            // Alternative format with full v-prefixed ID
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/(v[a-zA-Z0-9]{5,})-[\w\.-]+\.html/i,
+            
+            // Short URL format (if any)
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/([a-zA-Z0-9]{6,})\/?$/i
+        ];
+        
         let videoId: string | null = null;
-
-        if (standardMatch && standardMatch[1]) {
-            videoId = standardMatch[1];
-            console.log(`Detected standard Rumble video ID: ${videoId}`);
-        } else if (embedMatch && embedMatch[1]) {
-            videoId = embedMatch[1];
-            console.log(`Detected embedded Rumble video ID: ${videoId}`);
+        let fullMatch: string | null = null;
+        
+        // Try each pattern until we find a match
+        for (const pattern of patterns) {
+            const match = input.match(pattern);
+            if (match) {
+                // If we matched the pattern with full v-prefixed ID
+                if (pattern.toString().includes('(v[a-zA-Z0-9]')) {
+                    videoId = match[1]; // Use the complete v-prefixed ID
+                } else {
+                    // For other patterns, we might need to add the 'v' prefix if not present
+                    videoId = match[1].startsWith('v') ? match[1] : `v${match[1]}`;
+                }
+                fullMatch = match[0];
+                console.log(`Detected Rumble video ID: ${videoId} using pattern: ${pattern}`);
+                break;
+            }
         }
-
-        if (!videoId) return false;
-
+        
+        // If we still don't have a match, try a more general approach for edge cases
+        if (!videoId) {
+            // Very permissive pattern to catch edge cases
+            const lastResortMatch = input.match(/rumble\.com\/([a-zA-Z0-9]{1,2}[a-zA-Z0-9]{4,})/i);
+            if (lastResortMatch) {
+                videoId = lastResortMatch[1].startsWith('v') ? lastResortMatch[1] : `v${lastResortMatch[1]}`;
+                fullMatch = lastResortMatch[0];
+                console.log(`Detected Rumble video ID (last resort): ${videoId}`);
+            }
+        }
+    
+        if (!videoId) {
+            console.log('No Rumble video ID detected in input');
+            return false;
+        }
+    
         try {
+            // Normalize videoId - some Rumble IDs include the 'v' prefix, some don't
+            // For API usage, we want consistency
+            const normalizedId = videoId.startsWith('v') ? videoId : `v${videoId}`;
+            
+            // Log the full context for debugging
+            console.log(`Found Rumble URL: ${fullMatch}`);
+            console.log(`Normalized video ID for API: ${normalizedId}`);
+            
             // Show action menu for Rumble video
             await adapter.reply("🎬 I noticed a Rumble video link! Would you like me to retrieve data from this video?", {
                 reply_markup: {
                     inline_keyboard: [
                         [
-                            { text: "📝 Get Transcript", callback_data: `rumble_get:${videoId}:transcript` },
-                            { text: "ℹ️ Get Video Info", callback_data: `rumble_get:${videoId}:metadata` }
+                            { text: "📝 Get Transcript", callback_data: `rumble_get:${normalizedId}:transcript` },
+                            { text: "ℹ️ Get Video Info", callback_data: `rumble_get:${normalizedId}:metadata` }
                         ],
                         [
-                            { text: "💬 Get Comments", callback_data: `rumble_get:${videoId}:comments` }
+                            { text: "⬇️ Download Video", callback_data: `rumble_get:${normalizedId}:download` }
                         ]
                     ]
                 }
             });
-
+    
             return true; // URL was detected and handled
         } catch (error) {
             console.error("Error handling Rumble URL:", error);

@@ -18,15 +18,24 @@ import { ThinkingDisplayMode, ThinkingPreferences, ThinkingBlock } from './utils
 import { GameAgent } from './agents/GameAgent';
 import { PatternPromptAgent } from './agents/PatternPromptAgent';
 import * as commandModules from './commands';
+// At the top of CommandHandler.ts with other imports
 import {
     LifelineType,
     PatternContextData,
     PatternData,
-    ContextRequirement
+    ContextRequirement,
+    TranscriptionEstimate
 } from './commands/types';
 import { fsync } from 'fs';
+// At the top of CommandHandler.ts with other imports
+import {
+    transcriptionSettingsCommand,
+    createTranscriptionSettingsKeyboard,
+    formatTranscriptionSettingsMessage,
+    TranscriptionSettingsUtil
+} from './commands/transcriptionsettings';
 
-
+const transcriptionEstimates = new Map<string, TranscriptionEstimate>();
 
 export class CommandHandler {
     private bot: Telegraf<Context>;
@@ -273,6 +282,14 @@ export class CommandHandler {
                 const [action, botId] = ctx.match?.slice(1) || ['', ''];
 
                 await this.handleStandardMenuAction(adapter, action, parseInt(botId));
+            });
+
+            // Register the transcription settings action handler
+            this.bot.action(/^ts_([^:]+)(?::(\d+)(?::(.+))?)?$/, async (ctx) => {
+                const adapter = new ContextAdapter(ctx, this.promptManager);
+                const action = ctx.match[1];
+                const value = ctx.match[3];
+                await this.handleTranscriptionSettingsAction(adapter, action, value);
             });
             await this.bot.telegram.setMyCommands(botCommands);
             console.log('Bot commands set successfully');
@@ -3552,6 +3569,19 @@ export class CommandHandler {
                     result;
 
                 response = `📝 Retrieved ${youtubeAction} from YouTube video:\n\n${preview}`;
+
+                // For longer transcripts, also send as a downloadable file
+                if (result.length > 2000) {
+                    // Ensure FileManager is initialized
+                    if (!this.fileManager) {
+                        this.fileManager = new FileManager(this.telegramBot?.getBotToken());
+                    }
+
+                    // Create a descriptive filename
+                    const filename = `youtube_transcript_${videoId}_${new Date().toISOString().slice(0, 10)}`;
+                    await this.fileManager.saveAndSendAsText(adapter, result, filename);
+                }
+
             }
 
             // Use MenuManager to create a pattern selection menu
@@ -3577,47 +3607,165 @@ export class CommandHandler {
             await adapter.reply(`❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
+
     public async handleRumbleAction(adapter: ContextAdapter, videoId: string, rumbleAction: string): Promise<void> {
         const methodName = 'handleRumbleAction';
         console.log(`[${methodName}] Processing action for videoId: ${videoId}, action: ${rumbleAction}`);
-    
+
+        // Status message tracking
+        let statusMessageId: number | undefined;
+
+        // Status update function
+        // Status update function with timestamp to ensure content changes
+        const updateStatus = async (text: string) => {
+            try {
+                // Replace HTML line breaks with newlines for Telegram
+                const formattedText = text.replace(/<br>/g, '\n');
+
+                // Add a hidden timestamp to ensure content changes
+                const timestamp = Date.now();
+                const messageWithTimestamp = `${formattedText}\n\u200B${timestamp}`; // Zero-width space followed by timestamp
+
+                if (statusMessageId) {
+                    // Pass message ID directly as second parameter
+                    await adapter.editMessageText(messageWithTimestamp, statusMessageId);
+                } else {
+                    // Create new status message
+                    const statusMsg = await adapter.reply(`⏳ ${formattedText}`);
+                    if (statusMsg && 'message_id' in statusMsg) {
+                        statusMessageId = statusMsg.message_id;
+                    }
+                }
+            } catch (error) {
+                console.warn(`[${methodName}] Failed to update status:`, error);
+                // Non-critical error, continue execution
+            }
+        };
+
+        // Timer for status updates
+        let statusTimer: NodeJS.Timeout | null = null;
+        let processingStartTime: number | null = null;
+
         try {
             // Get user ID for storing content
             const { userId } = await this.conversationManager!.getSessionInfo(adapter);
-    
-            // Show loading message
-            await adapter.reply("⏳ Fetching content from Rumble... This may take a moment.");
-    
+
+            // Ensure FileManager is initialized
+            if (!this.fileManager) {
+                this.fileManager = new FileManager(this.telegramBot?.getBotToken());
+            }
+
+            // Show initial status message
+            const statusMsg = await adapter.reply("⏳ Fetching content from Rumble... This may take a moment.");
+            if (statusMsg && 'message_id' in statusMsg) {
+                statusMessageId = statusMsg.message_id;
+            }
+
+            // Show initial status message
+            await updateStatus("Fetching content from Rumble... This may take a moment.");
+
             // Get the tool manager
             const toolManager = this.getToolManager();
             if (!toolManager) {
                 throw new Error('ToolManager is not available');
             }
-    
+
             // Check if Rumble tool is available
             const toolNames = toolManager.getToolNames();
             const hasRumbleTool = toolNames.includes('rumble_tool');
-    
+
             if (!hasRumbleTool) {
                 await adapter.reply("❌ Rumble tool is not available. Please check your configuration.");
                 return;
             }
-    
+
+            // Get user's transcription settings
+            let transcriptionOptions = {};
+            try {
+                if (TranscriptionSettingsUtil && typeof TranscriptionSettingsUtil.getUserSettings === 'function') {
+                    const settings = TranscriptionSettingsUtil.getUserSettings(userId, this.conversationManager!);
+                    transcriptionOptions = {
+                        provider: settings.provider,
+                        modelSize: settings.modelSize,
+                        language: settings.language
+                    };
+                    console.log(`[${methodName}] Using user transcription settings:`, transcriptionOptions);
+                }
+            } catch (settingsError) {
+                console.warn(`[${methodName}] Error getting transcription settings:`, settingsError);
+            }
+
+            // Set up a periodic status update for long-running transcription
+            processingStartTime = Date.now();
+            let elapsedMinutes = 0;
+
+            // For long transcription operations, update status every 30 seconds
+            statusTimer = setInterval(async () => {
+                elapsedMinutes = Math.floor((Date.now() - processingStartTime!) / 60000);
+                
+                // Check if we have a transcription estimate
+                let estimateMsg = '';
+                try {
+                    const globalEstimates = (global as any).transcriptionEstimates;
+                    if (globalEstimates && globalEstimates instanceof Map) {
+                        const estimate = globalEstimates.get(videoId);
+                        if (estimate && (Date.now() - estimate.timestamp) < 5 * 60 * 1000) { // Only use if less than 5 minutes old
+                            estimateMsg = `\nEstimated total time: ${estimate.estimatedMinutes} minutes`;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Error checking for transcription estimate:', e);
+                }
+                
+                await updateStatus(
+                    `Still processing Rumble video...\n` +
+                    `⏱️ Elapsed time: ${elapsedMinutes} minutes${estimateMsg}\n` +
+                    `Please be patient for large videos.`
+                );
+            }, 30000); // Update every 30 seconds
+
             // Prepare the input for the tool
             const input = JSON.stringify({
-                url: videoId, // Just pass the ID, the tool will handle it
-                action: rumbleAction
+                url: videoId,
+                action: rumbleAction,
+                transcriptionOptions
             });
-    
+
             console.log(`[${methodName}] Executing Rumble tool with videoId: ${videoId}, action: ${rumbleAction}`);
+            // Update status to indicate we're moving to the transcription phase
+            await updateStatus("Downloading and processing video from Rumble...\nThis may take several minutes for longer videos.");
             const result = await toolManager.executeTool('rumble_tool', input);
-    
+
+            // Stop status updates
+            if (statusTimer) {
+                clearInterval(statusTimer);
+                statusTimer = null;
+            }
+
+            // Clean up status message
+            if (statusMessageId) {
+                try {
+                    await adapter.deleteMessage(statusMessageId);
+                    statusMessageId = undefined;
+                } catch (error) {
+                    console.warn(`[${methodName}] Failed to delete status message:`, error);
+                }
+            }
+
             // Check for errors or "Video not found" message
-            if (result.startsWith('Error:') || result.includes('Video not found')) {
-                await adapter.reply(`❌ ${result}`);
+            if (result.startsWith('Error:') ||
+                result.includes('Video not found') ||
+                result.includes('Failed to download')) {
+                // Sanitize the result to avoid HTML parsing errors
+                const safeResult = result
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;');
+
+                await adapter.reply(`❌ ${safeResult}`, { parse_mode: undefined });
                 return;
             }
-    
+
             // Create pattern data for future processing
             const patternDataKey = `pattern_data:${userId}`;
             let patternData = this.conversationManager!.cache.get<PatternData>(patternDataKey) || {
@@ -3625,16 +3773,16 @@ export class CommandHandler {
                 processedOutputs: {},
                 currentPatternState: {}
             };
-    
+
             // Store the result as originalInput for pattern processing
             patternData.originalInput = result;
-    
+
             // Also store it as a processed output
             patternData.processedOutputs["raw_rumble_data"] = {
                 output: result,
                 timestamp: Date.now()
             };
-    
+
             // Add video metadata to the pattern data
             patternData.sourceInfo = {
                 type: 'rumble',
@@ -3646,9 +3794,9 @@ export class CommandHandler {
                     fetchTime: new Date().toISOString()
                 }
             };
-    
+
             this.conversationManager!.cache.set(patternDataKey, patternData, 14400); // 4 hours
-    
+
             // For storing in context cache for pattern suggestions with Rumble-specific suggestion
             const rumblePatternSuggestion = {
                 pattern: rumbleAction === 'transcript' ? 'summarize_video_transcript' : 'analyze_video_content',
@@ -3659,7 +3807,7 @@ export class CommandHandler {
                     'create_qa_pairs'
                 ]
             };
-    
+
             const contextData = {
                 input: result,
                 interactionType: 'general_input',
@@ -3673,54 +3821,95 @@ export class CommandHandler {
                 }
             };
             this.conversationManager!.cache.set(`pattern_context:${userId}`, contextData, 14400); // 4 hours
-    
-            // Format the content for display based on action
-            let response: string;
-    
+
+            // Handle the result based on action type
             if (rumbleAction === 'metadata') {
                 try {
                     // Format JSON for display
                     const parsed = JSON.parse(result);
                     const title = parsed.title ? `\n\n**Title:** ${parsed.title}` : '';
-                    
-                    response = `📋 Retrieved metadata from Rumble video:${title}\n\n`;
-                    response += "```json\n" + JSON.stringify(parsed, null, 2).substring(0, 3000) + "\n```";
-                    
-                    if (JSON.stringify(parsed, null, 2).length > 3000) {
-                        response += "\n\n[Content truncated for display]";
-                    }
-                    
-                    await adapter.reply(response, { parse_mode: "Markdown" });
+
+                    const response = `📋 Retrieved metadata from Rumble video:${title}\n\n`;
+                    const formattedJson = "```json\n" + JSON.stringify(parsed, null, 2).substring(0, 3000) + "\n```";
+
+                    // Send the formatted response directly - these are typically small
+                    await adapter.reply(response + formattedJson, { parse_mode: "Markdown" });
                 } catch (e) {
                     await adapter.reply(result);
                 }
             } else if (rumbleAction === 'transcript') {
-                // For transcript, just show the full result
-                if (result.length > 4000) {
-                    // Split into multiple messages if too long
-                    const chunks = [];
-                    for (let i = 0; i < result.length; i += 4000) {
-                        chunks.push(result.substring(i, i + 4000));
+                try {
+                    // For transcripts, always send as a file for consistency
+                    // First send a preview message with the beginning of the transcript
+                    const preview = result.substring(0, 500) + "...";
+                    await adapter.reply(`📝 Retrieved transcript from Rumble video:\n\n${preview}\n\nSending full transcript as a file...`);
+
+                    // Create a descriptive filename that includes the video ID
+                    const filename = `rumble_transcript_${videoId}_${new Date().toISOString().slice(0, 10)}`;
+                    await this.fileManager.saveAndSendAsText(adapter, result, filename);
+
+                    // Show the pattern suggestion menu
+                    if (this.menuManager) {
+                        const keyboard = this.menuManager.createPatternSelectionMenu(
+                            rumblePatternSuggestion,
+                            rumblePatternSuggestion.alternativePatterns
+                        ).reply_markup;
+
+                        await adapter.reply(
+                            `📝 How would you like to process this transcript?`,
+                            {
+                                parse_mode: 'HTML',
+                                reply_markup: keyboard
+                            }
+                        );
                     }
-                    
-                    await adapter.reply(`📝 Retrieved transcript from Rumble video (split into ${chunks.length} parts):`);
-                    
-                    for (let i = 0; i < chunks.length; i++) {
-                        await adapter.reply(`Part ${i+1}/${chunks.length}:\n\n${chunks[i]}`);
+                } catch (fileError) {
+                    console.error(`[${methodName}] Error sending transcript as file:`, fileError);
+
+                    // If file sending fails, fall back to a message about processing the content
+                    await adapter.reply(
+                        "⚠️ Unable to send the full transcript as a file. " +
+                        "You can still process the transcript using the pattern menu below."
+                    );
+
+                    // Still show the pattern menu
+                    if (this.menuManager) {
+                        const keyboard = this.menuManager.createPatternSelectionMenu(
+                            rumblePatternSuggestion,
+                            rumblePatternSuggestion.alternativePatterns
+                        ).reply_markup;
+
+                        await adapter.reply(
+                            `📝 How would you like to process this transcript?`,
+                            {
+                                parse_mode: 'HTML',
+                                reply_markup: keyboard
+                            }
+                        );
                     }
-                } else {
-                    await adapter.reply(`📝 Retrieved transcript from Rumble video:\n\n${result}`);
                 }
             } else {
                 // For other actions like download
                 await adapter.reply(result);
             }
-    
         } catch (error) {
+            if (statusTimer) {
+                clearInterval(statusTimer);
+                statusTimer = null;
+            }
             console.error(`[${methodName}] Error:`, error);
-            
-            // Check for specific error codes to provide better messages
-            if (error.response?.status === 410 || 
+
+            // Clean up status message if it exists
+            if (statusMessageId) {
+                try {
+                    await adapter.deleteMessage(statusMessageId);
+                } catch (deleteError) {
+                    console.warn(`[${methodName}] Error deleting status message:`, deleteError);
+                }
+            }
+
+            // Handle specific error types
+            if (error.response?.status === 410 ||
                 (error.message && error.message.includes('410'))) {
                 await adapter.reply(
                     "📵 This Rumble video appears to be unavailable or has been removed.\n\n" +
@@ -3728,11 +3917,46 @@ export class CommandHandler {
                 );
             } else if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
                 await adapter.reply("📶 Unable to connect to Rumble's servers. Please check your internet connection and try again later.");
+            } else if (error.response?.status === 429 || (error.message && error.message.includes('429'))) {
+                // Rate limit error handling
+                await adapter.reply("⏳ Telegram rate limit reached. Please try again in a few moments.");
             } else {
                 await adapter.reply(`❌ Error: ${error instanceof Error ? error.message : 'Unknown error occurred while processing the Rumble request'}`);
             }
         }
     }
+
+    private async showPatternSuggestionMenu(
+        adapter: ContextAdapter,
+        userId: string,
+        suggestion: any
+    ): Promise<void> {
+        // Check if MenuManager is available
+        if (!this.menuManager) {
+            console.warn('MenuManager is not available for pattern suggestions');
+            return;
+        }
+
+        try {
+            // Create a pattern selection menu with video-specific suggestions
+            const keyboard = this.menuManager.createPatternSelectionMenu(
+                suggestion,
+                suggestion.alternativePatterns
+            ).reply_markup;
+
+            // Send the pattern menu
+            await adapter.reply(
+                `📝 How would you like to process this content?\n\nI recommend the <b>${suggestion.pattern}</b> pattern, which is ideal for video transcripts.`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard
+                }
+            );
+        } catch (error) {
+            console.error('Error showing pattern suggestion menu:', error);
+        }
+    }
+
 
     private async handlePatternDownload(
         adapter: ContextAdapter,
@@ -4203,6 +4427,181 @@ export class CommandHandler {
 
         // Now navigate to the first chunk
         await this.navigateInputChunks(adapter, userId, 'first');
+    }
+
+    // In CommandHandler.ts, add this new method
+    public async handleTranscriptionSettingsAction(adapter: ContextAdapter, action: string, value?: string): Promise<void> {
+        const methodName = 'handleTranscriptionSettingsAction';
+        console.log(`[${methodName}] Processing action: ${action}, value: ${value}`);
+
+        try {
+            // Get user ID for storing settings
+            const { userId } = await this.conversationManager!.getSessionInfo(adapter);
+
+            // Get current settings
+            const currentSettings = TranscriptionSettingsUtil.getUserSettings(userId, this.conversationManager!);
+
+            // Process the action
+            switch (action) {
+                case 'provider':
+                    if (value && ['local-cuda', 'local-cpu', 'assemblyai', 'google'].includes(value)) {
+                        // Check if this is the same as current setting
+                        if (currentSettings.provider === value) {
+                            // No change needed, just acknowledge the callback
+                            await adapter.answerCallbackQuery(`Already using ${value} provider`);
+                            return;
+                        }
+
+                        // Update the settings with new value
+                        const updatedSettings = TranscriptionSettingsUtil.updateSettings(
+                            userId,
+                            { provider: value as any },
+                            this.conversationManager!
+                        );
+
+                        // Update the message
+                        try {
+                            await this.updateTranscriptionSettingsMessage(adapter, updatedSettings);
+                        } catch (editError) {
+                            // If edit fails due to "not modified", just ignore
+                            if (!editError.message?.includes('message is not modified')) {
+                                throw editError;
+                            }
+                        }
+
+                        await adapter.answerCallbackQuery(`Transcription provider set to: ${value}`);
+                    } else {
+                        await adapter.answerCallbackQuery('Invalid provider selection');
+                    }
+                    break;
+
+                case 'model':
+                    if (value && ['tiny', 'base', 'small', 'medium', 'large'].includes(value)) {
+                        const updatedSettings = TranscriptionSettingsUtil.updateSettings(
+                            userId,
+                            { modelSize: value as any },
+                            this.conversationManager!
+                        );
+
+                        // Update the message
+                        await this.updateTranscriptionSettingsMessage(adapter, updatedSettings);
+                        await adapter.answerCallbackQuery(`Transcription model set to: ${value}`);
+                    } else {
+                        await adapter.answerCallbackQuery('Invalid model selection');
+                    }
+                    break;
+
+                case 'lang':
+                    if (value) {
+                        const updatedSettings = TranscriptionSettingsUtil.updateSettings(
+                            userId,
+                            { language: value },
+                            this.conversationManager!
+                        );
+
+                        // Update the message
+                        await this.updateTranscriptionSettingsMessage(adapter, updatedSettings);
+                        await adapter.answerCallbackQuery(`Language set to: ${value === 'auto' ? 'Auto-detect' : value}`);
+                    } else {
+                        await adapter.answerCallbackQuery('Invalid language selection');
+                    }
+                    break;
+
+                case 'more_langs':
+                    if (value) {
+                        const page = parseInt(value);
+                        await this.showLanguagePage(adapter, userId, page);
+                        await adapter.answerCallbackQuery('Language selection page');
+                    } else {
+                        await adapter.answerCallbackQuery('Invalid page');
+                    }
+                    break;
+
+                case 'back_main':
+                    await this.updateTranscriptionSettingsMessage(adapter, currentSettings);
+                    await adapter.answerCallbackQuery('Returned to main settings');
+                    break;
+
+                case 'close':
+                    await adapter.deleteMessage();
+                    await adapter.answerCallbackQuery('Transcription settings closed');
+                    break;
+
+                default:
+                    await adapter.answerCallbackQuery('Unknown action');
+                    break;
+            }
+        } catch (error) {
+            console.error(`[${methodName}] Error:`, error);
+            await adapter.answerCallbackQuery('Error processing request');
+        }
+    }
+
+    // Helper methods for the handler
+    private async updateTranscriptionSettingsMessage(adapter: ContextAdapter, settings: any): Promise<void> {
+        // Don't require anything - use the functions imported at the top of the file
+        await adapter.editMessageText(
+            formatTranscriptionSettingsMessage(settings),
+            {
+                parse_mode: 'Markdown',
+                reply_markup: createTranscriptionSettingsKeyboard(settings, this.bot?.botInfo?.id).reply_markup
+            }
+        );
+    }
+
+    private async showLanguagePage(adapter: ContextAdapter, userId: string, page: number): Promise<void> {
+
+        // Define proper tuple type for language entries
+        type LanguageEntry = [string, string]; // [display name, language code]
+
+        // Common languages by page with proper typing
+        const languagePages: LanguageEntry[][] = [
+            [], // Page 0 (not used)
+            [['English', 'en'], ['Spanish', 'es'], ['French', 'fr']],
+            [['German', 'de'], ['Italian', 'it'], ['Portuguese', 'pt']],
+            [['Russian', 'ru'], ['Japanese', 'ja'], ['Chinese', 'zh']]
+        ];
+
+        const totalPages = languagePages.length - 1;
+        const currentSettings = TranscriptionSettingsUtil.getUserSettings(userId, this.conversationManager!);
+
+        // Then use the correct typing in the map function
+        const languageButtons = languagePages[page].map((entry: LanguageEntry) => {
+            const [name, code] = entry;
+            return Markup.button.callback(
+                `${currentSettings.language === code ? '✅ ' : ''}${name}`,
+                `ts_lang:${this.bot?.botInfo?.id}:${code}`
+            );
+        });
+
+        // Add navigation buttons
+        const navButtons = [];
+        if (page > 1) {
+            navButtons.push(Markup.button.callback('⬅️ Previous', `ts_more_langs:${this.bot?.botInfo?.id}:${page - 1}`));
+        }
+        if (page < totalPages) {
+            navButtons.push(Markup.button.callback('Next ➡️', `ts_more_langs:${this.bot?.botInfo?.id}:${page + 1}`));
+        }
+
+        const backButton = [Markup.button.callback('Back to Main Settings', `ts_back_main:${this.bot?.botInfo?.id}`)];
+
+        // Create keyboard
+        const keyboard = Markup.inlineKeyboard([
+            languageButtons,
+            navButtons,
+            backButton
+        ]);
+
+        // Update message with language selection
+        await adapter.editMessageText(
+            `⚙️ *Transcription Settings - Languages*\n\n` +
+            `Select a language for transcription (Page ${page}/${totalPages}):\n\n` +
+            `Current language: ${currentSettings.language === 'auto' ? 'Auto-detect' : currentSettings.language}`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: keyboard.reply_markup
+            }
+        );
     }
 
 }

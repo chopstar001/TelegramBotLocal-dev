@@ -9,8 +9,12 @@ import * as path from 'path';
 import { TranscriptionService } from '../services/TranscriptionService';
 import {
     TranscriptionProvider,
-    TranscriptionOptions
+    TranscriptionOptions,
+    TranscriptionEstimate
 } from '../commands/types';
+import { AssemblyAI } from 'assemblyai'
+
+type StatusCallback = (status: string) => Promise<void>;
 
 const execAsync = promisify(exec);
 
@@ -22,16 +26,24 @@ export class RumbleTool extends Tool {
     ffmpegAvailable: boolean = false;
     private transcriptionService: TranscriptionService;
 
+    transcriptionPreferences: Record<string, any> = {};
+    assemblyAIAvailable: boolean = false;
 
-    constructor(tempDir = './temp', config = {}) {
+    private statusCallback: StatusCallback | null = null;
+
+
+    constructor(tempDir = './temp', config: {
+        transcriptionPreferences?: Record<string, any>
+    } = {}) {
         super();
         this.tempDir = tempDir;
         if (!fs.existsSync(this.tempDir)) {
             fs.mkdirSync(this.tempDir, { recursive: true });
         }
 
+
         // Initialize transcription service
-        // Initialize transcription service
+
         this.transcriptionService = new TranscriptionService({
             defaultProvider: 'local-cuda', // Use your RTX 3090 by default
             apiKeys: {
@@ -39,9 +51,19 @@ export class RumbleTool extends Tool {
                 'google': process.env.GOOGLE_API_KEY || ''          // Add empty string as fallback
             }
         });
+        // Store transcription preferences from config
+        this.transcriptionPreferences = config.transcriptionPreferences || {};
 
         // Check dependencies availability
         this.checkDependenciesAvailability();
+
+        // Check if AssemblyAI is available
+        this.assemblyAIAvailable = !!process.env.ASSEMBLYAI_API_KEY;
+        if (this.assemblyAIAvailable) {
+            console.log('AssemblyAI API key found, transcription service available');
+        } else {
+            console.log('AssemblyAI API key not found, some transcription features may be limited');
+        }
     }
 
     private async checkDependenciesAvailability(): Promise<void> {
@@ -77,31 +99,31 @@ export class RumbleTool extends Tool {
             if (!args) {
                 return "Error: Missing input";
             }
-
-            let { url, action } = JSON.parse(args);
-
+    
+            let { url, action, transcriptionOptions = {} } = JSON.parse(args);
+    
             console.log(`Raw URL from input: "${url}"`);
-
+    
             // Extract and validate the video ID
             const videoId = this.extractVideoId(url);
             console.log(`Extracted video ID: "${videoId}" from URL: "${url}"`);
-
+    
             if (!videoId) {
                 return "Error: Invalid Rumble URL. Please provide a valid Rumble video URL.";
             }
-
+    
             // Normalize the URL for consistency
             const fullUrl = `https://rumble.com/embed/${videoId}`;
-
+    
             switch (action) {
                 case 'transcript': {
                     // Check if required tools are available
                     if (!this.ytDlpAvailable) {
                         return "Error: yt-dlp is required for transcript extraction but is not available. Please install it to use this feature.";
                     }
-
-                    // Focus on downloading and transcribing
-                    const transcript = await this.downloadAndTranscribe(videoId, fullUrl);
+    
+                    // Focus on downloading and transcribing, now passing the transcription options
+                    const transcript = await this.downloadAndTranscribe(videoId, fullUrl, transcriptionOptions);
                     return transcript;
                 }
                 case 'metadata': {
@@ -113,7 +135,7 @@ export class RumbleTool extends Tool {
                     if (!this.ytDlpAvailable) {
                         return "Error: yt-dlp is required for video download but is not available. Please install it to use this feature.";
                     }
-
+    
                     const downloadResult = await this.downloadVideo(videoId, fullUrl);
                     return downloadResult;
                 }
@@ -131,40 +153,60 @@ export class RumbleTool extends Tool {
             console.log('URL is empty or undefined');
             return null;
         }
-
+        
         console.log(`Extracting video ID from: "${url}"`);
-
-        // Standard Rumble URL pattern
-        // Example: https://rumble.com/v4e1edj-video-title.html
-        const videoPattern = /(?:https?:\/\/)?(?:www\.)?rumble\.com\/([a-zA-Z0-9]{6,})-[\w-]+\.html/i;
-        const match = url.match(videoPattern);
-
-        if (match && match[1]) {
-            console.log(`Extracted ID via standard pattern: "${match[1]}"`);
-            return match[1];
+        
+        // Array of patterns to try in order
+        const patterns = [
+            // Standard URL format with v-prefix: rumble.com/v123abc-title.html
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/v([a-zA-Z0-9]{5,})-[\w\.-]+\.html/i,
+            
+            // Standard URL with full ID: rumble.com/v123abc-title.html (capturing the v-prefix too)
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/(v[a-zA-Z0-9]{5,})-[\w\.-]+\.html/i,
+            
+            // Embed format: rumble.com/embed/v123abc
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/embed\/([a-zA-Z0-9]{5,})/i,
+            
+            // Embed format with v-prefix: rumble.com/embed/v123abc
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/embed\/(v[a-zA-Z0-9]{5,})/i,
+            
+            // Short URL format (if any)
+            /(?:https?:\/\/)?(?:www\.)?rumble\.com\/([a-zA-Z0-9]{6,})\/?$/i
+        ];
+        
+        // Try each pattern
+        for (const pattern of patterns) {
+            const match = url.match(pattern);
+            if (match && match[1]) {
+                // Normalize ID format - ensure it has the 'v' prefix
+                const extractedId = match[1];
+                const normalizedId = extractedId.startsWith('v') ? extractedId : `v${extractedId}`;
+                console.log(`Extracted ID: "${extractedId}", Normalized: "${normalizedId}"`);
+                return normalizedId;
+            }
         }
-
-        // Shortened URL pattern
-        // Example: https://rumble.com/embed/v4e1edj
-        const embedPattern = /(?:https?:\/\/)?(?:www\.)?rumble\.com\/embed\/([a-zA-Z0-9]{6,})/i;
-        const embedMatch = url.match(embedPattern);
-
-        if (embedMatch && embedMatch[1]) {
-            console.log(`Extracted ID via embed pattern: "${embedMatch[1]}"`);
-            return embedMatch[1];
+        
+        // If we get here, no standard patterns matched. Try one more general approach
+        // Look for any segment that starts with v followed by at least 5 alphanumeric chars
+        const generalMatch = url.match(/v([a-zA-Z0-9]{5,})/i);
+        if (generalMatch) {
+            const extractedPart = generalMatch[0]; // This includes the v prefix
+            console.log(`Extracted ID via general pattern: "${extractedPart}"`);
+            return extractedPart;
         }
-
-        // If it's already just an ID, return it
-        if (/^[a-zA-Z0-9]{6,}$/.test(url)) {
-            console.log(`URL is already a valid video ID: "${url}"`);
-            return url;
+        
+        // If it's already just an ID format, return it (with v prefix if needed)
+        if (/^v?[a-zA-Z0-9]{5,}$/.test(url)) {
+            const normalizedId = url.startsWith('v') ? url : `v${url}`;
+            console.log(`URL is already a valid video ID: "${url}", Normalized: "${normalizedId}"`);
+            return normalizedId;
         }
-
+        
         console.log('Failed to extract video ID');
         return null;
     }
 
-    private async downloadAndTranscribe(videoId: string, fullUrl: string): Promise<string> {
+private async downloadAndTranscribe(videoId: string, fullUrl: string, options: TranscriptionOptions = {}): Promise<string> {
         try {
             console.log(`Downloading and transcribing video: ${videoId}`);
 
@@ -174,64 +216,221 @@ export class RumbleTool extends Tool {
                 fs.mkdirSync(outputDir, { recursive: true });
             }
 
-            // First attempt to download just audio (faster and smaller)
-            const audioPath = path.join(outputDir, `${videoId}.m4a`);
-            console.log(`Downloading audio for ${videoId} to ${audioPath}`);
+            // Create multiple URL variations to try
+            const urlVariations = [
+                `https://rumble.com/v${videoId}`,      // Direct URL with 'v' prefix (most likely to work)
+                `https://rumble.com/${videoId}`,       // Direct URL without 'v' prefix
+                fullUrl                               // Original URL (likely embed URL)
+            ];
+
+            let redirectedIds = new Set<string>();
+
+            // First attempt to check available formats to guide our approach
+            let availableFormats = '';
+            let bestFormatId = '';
+            let workingUrl = '';
 
             try {
-                // First check if the video exists and is accessible
-                const videoCheckCmd = `yt-dlp --skip-download --dump-json ${fullUrl}`;
-                const videoCheckResult = await execAsync(videoCheckCmd);
+                for (const url of urlVariations) {
+                    try {
+                        console.log(`Checking available formats for: ${url}`);
+                        const { stdout, stderr } = await execAsync(`yt-dlp --list-formats ${url}`);
+                        availableFormats = stdout;
 
-                // If we get here, the video exists, now download audio
-                const downloadCmd = `yt-dlp -f "bestaudio[ext=m4a]" -o "${audioPath}" ${fullUrl}`;
-                const downloadResult = await execAsync(downloadCmd);
+                        // Check if we got redirected to a different video ID
+                        const redirectMatch = stderr.match(/\[RumbleEmbed\] ([\w\d]+): Downloading/);
+                        if (redirectMatch && redirectMatch[1] && redirectMatch[1] !== videoId) {
+                            const redirectedId = redirectMatch[1];
+                            console.log(`Detected redirect to video ID: ${redirectedId}`);
+                            redirectedIds.add(redirectedId);
 
-                console.log(`Successfully downloaded audio: ${downloadResult.stdout}`);
+                            // Add the redirected URLs to our variations
+                            urlVariations.push(`https://rumble.com/v${redirectedId}`);
+                            urlVariations.push(`https://rumble.com/embed/${redirectedId}`);
+                        }
 
-                // Generate transcript from existing captions
-                const captionsTranscript = await this.extractExistingCaptions(videoId, fullUrl, outputDir);
-                if (captionsTranscript && captionsTranscript.length > 0) {
-                    // Clean up files
-                    this.cleanupTempFiles(outputDir);
-                    return captionsTranscript;
+                        console.log(`Successfully found formats for: ${url}`);
+                        workingUrl = url; // Remember which URL worked
+                        break; // Exit the loop if we successfully get formats
+                    } catch (error) {
+                        console.log(`Failed to get formats for ${url}: ${error.message}`);
+
+                        // Check the error message for redirected video IDs
+                        const redirectMatch = error.message.match(/\[RumbleEmbed\] ([\w\d]+):/);
+                        if (redirectMatch && redirectMatch[1] && redirectMatch[1] !== videoId) {
+                            const redirectedId = redirectMatch[1];
+                            console.log(`Detected redirect to video ID: ${redirectedId} in error message`);
+                            redirectedIds.add(redirectedId);
+
+                            // Add the redirected URLs to our variations if not already present
+                            const redirectUrl1 = `https://rumble.com/v${redirectedId}`;
+                            const redirectUrl2 = `https://rumble.com/embed/${redirectedId}`;
+
+                            if (!urlVariations.includes(redirectUrl1)) {
+                                urlVariations.push(redirectUrl1);
+                            }
+                            if (!urlVariations.includes(redirectUrl2)) {
+                                urlVariations.push(redirectUrl2);
+                            }
+                        }
+                    }
                 }
+            } catch (error) {
+                console.log(`Error checking formats: ${error.message}`);
+            }
 
-                // If we have ffmpeg, we can process the audio
-                if (this.ffmpegAvailable) {
-                    // Use OpenAI's Whisper API or a local whisper model
-                    // Note: This is a placeholder - you'll need to implement actual transcription
-                    const transcriptionResult = await this.transcribeAudio(audioPath);
+            // If we couldn't get format info from any URL, return early
+            if (!availableFormats || !workingUrl) {
+                return `Could not access this Rumble video. It may be private, removed, or region-restricted.`;
+            }
 
-                    // Clean up files
-                    this.cleanupTempFiles(outputDir);
+            console.log('Available formats:');
+            console.log(availableFormats);
 
-                    return transcriptionResult;
-                } else {
-                    return `Audio downloaded successfully to ${audioPath}. Please use a transcription service to generate a transcript.`;
+            // Parse the available formats and find a suitable format ID
+            const formatLines = availableFormats.split('\n');
+
+            // First try to find an audio-only format
+            const audioFormats = formatLines.filter(line => line.includes('audio only'));
+
+            if (audioFormats.length > 0) {
+                // Found audio-only format
+                const formatMatch = audioFormats[0].match(/^(\S+)/);
+                if (formatMatch && formatMatch[1]) {
+                    bestFormatId = formatMatch[1];
+                    console.log(`Found audio-only format ID: ${bestFormatId}`);
                 }
+            } else {
+                // No audio-only format, look for a video format (smallest file size first)
+                // Filter lines that look like actual formats (have mp4, have filesize)
+                const videoFormats = formatLines.filter(line =>
+                    line.includes('mp4') &&
+                    !line.includes('video only') &&
+                    line.match(/\d+\.\d+\w+/) // Has a file size
+                );
 
-            } catch (downloadError) {
-                console.error(`Error downloading video: ${downloadError}`);
-
-                // Check if the error indicates the video doesn't exist
-                if (downloadError.stderr && downloadError.stderr.includes('HTTP Error 410')) {
-                    return "Video not found. This Rumble video appears to be unavailable or has been removed.";
-                }
-
-                // Try an alternative download method
-                try {
-                    const altDownloadCmd = `yt-dlp -f "best[filesize<50M]" -o "${outputDir}/${videoId}.mp4" ${fullUrl}`;
-                    await execAsync(altDownloadCmd);
-
-                    return `Video downloaded to ${outputDir}/${videoId}.mp4. Please use a transcription service to generate a transcript.`;
-
-                } catch (altError) {
-                    console.error(`Alternative download method failed: ${altError}`);
-                    return `Failed to download video. Error: ${altError.message}`;
+                if (videoFormats.length > 0) {
+                    // Find the format ID from the first video format
+                    const formatMatch = videoFormats[0].match(/^(\S+)/);
+                    if (formatMatch && formatMatch[1]) {
+                        bestFormatId = formatMatch[1];
+                        console.log(`Found video format ID: ${bestFormatId}`);
+                    }
                 }
             }
 
+            // If we still don't have a format ID, try to extract it from raw format string
+            if (!bestFormatId) {
+                // Look for lines with "ID" and "EXT" to find the format ID column
+                const headerLine = formatLines.find(line => line.includes('ID') && line.includes('EXT'));
+                if (headerLine) {
+                    // The next non-empty line should have a format
+                    for (let i = formatLines.indexOf(headerLine) + 1; i < formatLines.length; i++) {
+                        if (formatLines[i].trim() && !formatLines[i].startsWith('-')) {
+                            const firstField = formatLines[i].trim().split(/\s+/)[0];
+                            if (firstField) {
+                                bestFormatId = firstField;
+                                console.log(`Extracted format ID from table: ${bestFormatId}`);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If we have a format ID, try to download with it
+            if (bestFormatId) {
+                console.log(`Using format ID: ${bestFormatId} with URL: ${workingUrl}`);
+                const outputPath = path.join(outputDir, `${videoId}.download`);
+
+                try {
+                    // Use the specific format ID with the URL that worked
+                    const downloadCmd = `yt-dlp -f ${bestFormatId} -o "${outputPath}" ${workingUrl}`;
+                    console.log(`Running command: ${downloadCmd}`);
+                    await execAsync(downloadCmd);
+
+                    // Check if download succeeded
+                    if (fs.existsSync(outputPath)) {
+                        console.log(`Successfully downloaded with format ID: ${bestFormatId}`);
+
+                        // Check for captions first
+                        try {
+                            const captionsTranscript = await this.extractExistingCaptions(videoId, workingUrl, outputDir);
+                            if (captionsTranscript && captionsTranscript.length > 0) {
+                                console.log(`Found captions for ${workingUrl}`);
+                                this.cleanupTempFiles(outputDir);
+                                return captionsTranscript;
+                            }
+                        } catch (error) {
+                            console.log(`No captions found for ${workingUrl}: ${error.message}`);
+                        }
+
+                        // If no captions, extract audio and transcribe
+                        if (this.ffmpegAvailable) {
+                            const wavPath = path.join(outputDir, `${videoId}.wav`);
+                            try {
+                                console.log(`Extracting audio to WAV format at ${wavPath}`);
+                                await execAsync(`ffmpeg -i "${outputPath}" -ar 16000 -ac 1 -c:a pcm_s16le "${wavPath}"`);
+
+                                if (fs.existsSync(wavPath)) {
+                                    // Transcribe the audio
+                                    const transcriptionResult = await this.transcribeAudio(wavPath, options, videoId);                                    this.cleanupTempFiles(outputDir);
+                                    return transcriptionResult;
+                                }
+                            } catch (error) {
+                                console.error(`Error extracting audio: ${error.message}`);
+                            }
+                        }
+
+                        // If we couldn't extract audio or transcribe, return a message
+                        return `Successfully downloaded the Rumble video, but could not extract audio for transcription.`;
+                    } else {
+                        console.log(`File not found after download: ${outputPath}`);
+                    }
+                } catch (error) {
+                    console.log(`Failed to download with format ID ${bestFormatId}: ${error.message}`);
+                }
+            }
+
+            // Fall back to trying common format IDs that often work with Rumble
+            const commonFormatIds = ['mp4-360p-0', 'mp4-180p'];
+
+            for (const formatId of commonFormatIds) {
+                const outputPath = path.join(outputDir, `${videoId}.download`);
+
+                try {
+                    console.log(`Trying common format ID: ${formatId} with URL: ${workingUrl}`);
+                    const downloadCmd = `yt-dlp -f ${formatId} -o "${outputPath}" ${workingUrl}`;
+                    await execAsync(downloadCmd);
+
+                    if (fs.existsSync(outputPath)) {
+                        console.log(`Successfully downloaded with common format ID: ${formatId}`);
+
+                        // Extract audio and transcribe
+                        if (this.ffmpegAvailable) {
+                            const wavPath = path.join(outputDir, `${videoId}.wav`);
+                            try {
+                                await execAsync(`ffmpeg -i "${outputPath}" -ar 16000 -ac 1 -c:a pcm_s16le "${wavPath}"`);
+
+                                if (fs.existsSync(wavPath)) {
+                                    // Transcribe the audio
+                                    const transcriptionResult = await this.transcribeAudio(wavPath, options, videoId);                                    this.cleanupTempFiles(outputDir);
+                                    return transcriptionResult;
+                                }
+                            } catch (error) {
+                                console.error(`Error extracting audio: ${error.message}`);
+                            }
+                        }
+
+                        return `Successfully downloaded the Rumble video, but could not extract audio for transcription.`;
+                    }
+                } catch (error) {
+                    console.log(`Failed to download with common format ID ${formatId}: ${error.message}`);
+                }
+            }
+
+            // If everything else failed
+            return `Could not download this Rumble video. Format not available or video is restricted.`;
         } catch (error) {
             console.error(`Error in downloadAndTranscribe:`, error);
 
@@ -537,14 +736,21 @@ export class RumbleTool extends Tool {
         }
     }
 
-    private cleanupTempFiles(directory: string): void {
+    private cleanupTempFiles(directory: string, removeDir: boolean = true, keepFiles: string[] = []): void {
         try {
             if (fs.existsSync(directory)) {
                 const files = fs.readdirSync(directory);
                 for (const file of files) {
-                    fs.unlinkSync(path.join(directory, file));
+                    const filePath = path.join(directory, file);
+                    // Skip files that should be kept
+                    if (keepFiles.includes(filePath)) {
+                        continue;
+                    }
+                    fs.unlinkSync(filePath);
                 }
-                fs.rmdirSync(directory);
+                if (removeDir) {
+                    fs.rmdirSync(directory);
+                }
             }
         } catch (error) {
             console.error('Error cleaning up temporary files:', error);
@@ -554,39 +760,208 @@ export class RumbleTool extends Tool {
 
 
 
-    private async transcribeAudio(audioPath: string, options: TranscriptionOptions = {}): Promise<string> {
-        // Default options if not specified - define OUTSIDE the try block
-        const transcriptionOptions = {
-            provider: options.provider || 'local-cuda', // Use RTX 3090 by default
-            modelSize: options.modelSize || 'medium',   // Good balance of accuracy and speed
-            language: options.language || 'auto'        // Auto-detect language
-        };
-
+    private async transcribeAudio(audioPath: string, options: TranscriptionOptions = {}, videoId?: string): Promise<string> {
         try {
             console.log(`Transcribing audio file: ${audioPath}`);
-
-            // Transcribe using the service
-            const result = await this.transcriptionService.transcribe(audioPath, transcriptionOptions);
-
-            // Return the transcribed text
-            return result || 'Transcription produced no text.';
+    
+            // Get file size for time estimation
+            const fileStats = fs.statSync(audioPath);
+            const fileSizeBytes = fileStats.size;
+            console.log(`Audio file size for transcription: ${fileSizeBytes} bytes (${(fileSizeBytes / (1024 * 1024)).toFixed(2)} MB)`);
+            
+            // Determine which transcription method to use based on options or preferences
+            const provider = options.provider || 'local-cuda'; // Default to local CUDA if available
+            
+            // Estimate transcription time
+            const estimatedMinutes = this.estimateTranscriptionTime(fileSizeBytes, provider);
+            console.log(`Estimated transcription time: ${estimatedMinutes} minutes`);
+            
+            // Log in a special format for the CommandHandler to parse
+            if (videoId) {
+                console.log(`TRANSCRIPTION_ESTIMATE:${videoId}:${estimatedMinutes}`);
+            }
+            
+            this.publishTranscriptionEstimate(videoId as string, fileSizeBytes, provider);
+            // Send status update if callback is available
+            if (this.statusCallback) {
+                const readableProvider = provider === 'local-cuda' ? 'GPU (CUDA)' : 
+                                        provider === 'local-cpu' ? 'CPU' : 
+                                        provider.charAt(0).toUpperCase() + provider.slice(1);
+                
+                await this.statusCallback(`Transcribing ${(fileSizeBytes / (1024 * 1024)).toFixed(1)}MB audio using ${readableProvider}. Estimated time: ${estimatedMinutes} minutes.`);
+            }
+    
+            // Use AssemblyAI if selected
+            if (provider === 'assemblyai') {
+                console.log('Using AssemblyAI for transcription');
+            
+                // Get API key from options or environment variable
+                const apiKey = options.apiKey || process.env.ASSEMBLYAI_API_KEY;
+                if (!apiKey) {
+                    throw new Error('AssemblyAI API key not provided');
+                }
+            
+                // Import the AssemblyAI SDK
+                const { AssemblyAI } = require('assemblyai');
+                const client = new AssemblyAI({
+                    apiKey: apiKey
+                });
+            
+                // For local files, we need to upload first
+                // Fix the language code - AssemblyAI doesn't support 'auto'
+                let languageCode = options.language || 'en';
+                // If language is set to 'auto', default to 'en' for AssemblyAI
+                if (languageCode === 'auto') {
+                    console.log('AssemblyAI does not support automatic language detection. Using English (en) as default.');
+                    languageCode = 'en';
+                }
+            
+                // Set params with the corrected language code
+                const params = {
+                    audio: audioPath,
+                    speaker_labels: true,
+                    language_code: languageCode
+                };
+                
+                // Perform the transcription
+                const transcript = await client.transcripts.transcribe(params);
+    
+                // Check for errors
+                if (transcript.status === 'error') {
+                    throw new Error(`AssemblyAI transcription failed: ${transcript.error}`);
+                }
+    
+                // Return the transcript text
+                return transcript.text || 'Transcription produced no text.';
+            }
+    
+            // Use local Whisper if selected
+            else if (provider === 'local-cuda' || provider === 'local-cpu') {
+                console.log(`Using local Whisper (${provider}) for transcription`);
+    
+                // Check if whisper.cpp is available
+                const whisperPath = '/usr/local/bin/whisper'; // Adjust as needed
+                const modelSize = options.modelSize || 'medium';
+                const modelPath = path.join(process.cwd(), 'models', `ggml-${modelSize}.bin`);
+    
+                // Check if model exists, download if necessary
+                if (!fs.existsSync(modelPath)) {
+                    console.log(`Model file not found: ${modelPath}, downloading...`);
+                    // You would implement downloadModel here
+                    // await this.downloadModel(modelSize);
+                }
+    
+                if (fs.existsSync(whisperPath)) {
+                    // Set device flag based on provider
+                    const deviceFlag = provider === 'local-cuda' ? '--device cuda' : '';
+                    // Set language flag if specified
+                    const langFlag = options.language && options.language !== 'auto'
+                        ? `--language ${options.language}`
+                        : '';
+    
+                    // Execute whisper command
+                    const whisperCmd = `${whisperPath} -m ${modelPath} -f "${audioPath}" ${deviceFlag} ${langFlag}`;
+                    console.log(`Executing: ${whisperCmd}`);
+    
+                    const { stdout, stderr } = await execAsync(whisperCmd, { maxBuffer: 1024 * 1024 * 10 });
+    
+                    if (stderr) {
+                        console.warn('Warning during transcription:', stderr);
+                    }
+    
+                    return stdout.trim() || 'Transcription produced no text.';
+                } else {
+                    throw new Error('Whisper executable not found');
+                }
+            }
+    
+            // Fallback or unsupported provider
+            else {
+                console.warn(`Unsupported transcription provider: ${provider}`);
+                return `Audio file extracted: ${audioPath}. No suitable transcription method available for provider: ${provider}.`;
+            }
+    
         } catch (error) {
             console.error('Error transcribing audio:', error);
-
-            // If local transcription fails, try API as fallback
-            if (transcriptionOptions.provider === 'local-cuda' || transcriptionOptions.provider === 'local-cpu') {
+    
+            // Try fallback if original method fails
+            if (options.provider !== 'assemblyai') {
                 try {
-                    console.log('Local transcription failed, trying AssemblyAI as fallback...');
-                    return await this.transcriptionService.transcribe(audioPath, {
-                        ...transcriptionOptions,
+                    console.log('Transcription failed, trying AssemblyAI as fallback...');
+                    
+                    // Update status callback if available
+                    if (this.statusCallback) {
+                        await this.statusCallback('Transcription failed, switching to AssemblyAI as fallback...');
+                    }
+                    
+                    // Call recursively with AssemblyAI as provider
+                    return await this.transcribeAudio(audioPath, {
+                        ...options,
                         provider: 'assemblyai'
                     });
                 } catch (fallbackError) {
                     console.error('Fallback transcription also failed:', fallbackError);
                 }
             }
-
-            return `Error transcribing audio: ${error instanceof Error ? error.message : String(error)}. Please try again later.`;
+    
+            return `Error transcribing audio: ${error.message}. Please try again later.`;
         }
     }
+
+    // In RumbleTool.ts, add this new helper method
+    // Add the setter method
+    public setStatusCallback(callback: StatusCallback | null): void {
+        this.statusCallback = callback;
+    }
+    /**
+     * Estimates transcription time based on file size and provider
+     * @param fileSizeBytes File size in bytes
+     * @param provider Transcription provider being used
+     * @returns Estimated time in minutes
+     */
+    private estimateTranscriptionTime(fileSizeBytes: number, provider: TranscriptionProvider): number {
+        // Convert bytes to MB for easier calculation
+        const fileSizeMB = fileSizeBytes / (1024 * 1024);
+        
+        // Base speeds (MB per minute) for different providers
+        // These are rough estimates based on observation and can be adjusted
+        const processingSpeed: Record<string, number> = {
+            'local-cuda': 15,    // RTX 3090 is fast - around 15MB/min
+            'local-cpu': 5,      // CPU is slower - around 5MB/min
+            'assemblyai': 10,    // AssemblyAI - around 10MB/min based on logs
+            'google': 12         // Google - estimate based on their API
+        };
+        
+        // Get appropriate speed or use assemblyai as fallback
+        const speed = processingSpeed[provider] || processingSpeed.assemblyai;
+        
+        // Calculate time in minutes - ensure we have a reasonable minimum
+        let estimatedMinutes = Math.max(1, fileSizeMB / speed);
+        
+        // Add a buffer for API latency and processing overhead
+        estimatedMinutes += 1;
+        
+        // Round up to nearest 0.5 minute
+        return Math.ceil(estimatedMinutes * 2) / 2;
+    }
+    private publishTranscriptionEstimate(videoId: string, fileSizeBytes: number, provider: string): void {
+        try {
+            const estimatedMinutes = this.estimateTranscriptionTime(fileSizeBytes, provider as TranscriptionProvider);
+            
+            // Store in the global map with a timestamp
+            const estimate: TranscriptionEstimate = {
+                videoId,
+                estimatedMinutes,
+                timestamp: Date.now()
+            };
+            
+            (global as any).transcriptionEstimates = (global as any).transcriptionEstimates || new Map();
+            (global as any).transcriptionEstimates.set(videoId, estimate);
+            
+            console.log(`[RumbleTool] Published transcription estimate: ${estimatedMinutes} minutes for ${videoId}`);
+        } catch (error) {
+            console.warn(`[RumbleTool] Error publishing estimate:`, error);
+        }
+    }
+
 }

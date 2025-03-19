@@ -161,6 +161,69 @@ export class FileManager {
             await adapter.reply(`📑 PDF file created: ${filePath} (could not send directly: ${error.message})`);
         }
     }
+
+
+    public async saveAndSendTranscript(
+        adapter: ContextAdapter,
+        content: string,
+        videoId: string,
+        source: 'youtube' | 'rumble'
+    ): Promise<void> {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const sourcePrefix = source === 'youtube' ? 'yt' : 'rumble';
+        const safeFilename = `${sourcePrefix}_transcript_${this.sanitizeFilename(videoId)}_${timestamp}`;
+
+        // Format the transcript for better readability
+        const formattedContent = this.formatTranscript(content, videoId, source);
+
+        // First attempt to send as a text file
+        try {
+            await this.saveAndSendAsText(adapter, formattedContent, safeFilename);
+        } catch (error) {
+            console.error(`Error sending transcript as text: ${error.message}`);
+
+            // If text file fails, try sending as PDF
+            try {
+                await this.saveAndSendAsPDF(adapter, formattedContent, safeFilename, `${source.toUpperCase()} Transcript: ${videoId}`);
+            } catch (pdfError) {
+                console.error(`Error sending transcript as PDF: ${pdfError.message}`);
+
+                // Last resort - send a message with the error and instructions
+                await adapter.reply(
+                    `❌ Unable to send full transcript due to an error. You can access the transcript through the pattern processing menu by clicking "Use raw_rumble_data" option.`
+                );
+            }
+        }
+    }
+
+    /**
+    * Format transcript content for better readability
+    */
+    private formatTranscript(content: string, videoId: string, source: 'youtube' | 'rumble'): string {
+        // Add a header with video information
+        const header = `# Transcript: ${source.toUpperCase()} Video ${videoId}\n` +
+            `Retrieved: ${new Date().toLocaleString()}\n\n` +
+            `Source: ${source === 'youtube' ? 'YouTube' : 'Rumble'}\n` +
+            `Video ID: ${videoId}\n\n` +
+            `${'='.repeat(80)}\n\n`;
+
+        // Clean up any problematic formatting in the content
+        let cleanedContent = content
+            .replace(/\r\n/g, '\n')
+            .replace(/\n{3,}/g, '\n\n');
+
+        // If content has timestamps (in format [00:00:00 - 00:00:00]), enhance the formatting
+        if (content.match(/\[\d{2}:\d{2}:\d{2} - \d{2}:\d{2}:\d{2}\]/)) {
+            cleanedContent = cleanedContent.replace(
+                /\[(\d{2}:\d{2}:\d{2}) - (\d{2}:\d{2}:\d{2})\] (.*?)(?=\n\[|$)/gs,
+                '## [$1 - $2]\n$3\n'
+            );
+        }
+
+        return header + cleanedContent;
+    }
+
+
     private parseContentSections(content: string): Array<{
         type: string;
         content: string;

@@ -995,3 +995,9 @@ export interface TranscriptionOptions {
   language?: string;
   apiKey?: string;
 }
+
+export interface TranscriptionEstimate {
+    videoId: string;
+    estimatedMinutes: number;
+    timestamp: number;
+}

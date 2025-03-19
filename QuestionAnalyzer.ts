@@ -4,6 +4,7 @@ import { SystemMessage, HumanMessage, AIMessage, BaseMessage } from '@langchain/
 import { invokeModelWithFallback } from './utils/modelUtility';
 import { MessageContext, GroupMemberInfo } from './commands/types';
 import { logInfo, logDebug, logError, logWarn } from './loggingUtility';
+import { ConversationManager } from './ConversationManager';
 
 export interface QuestionAnalysisResult {
     isQuestion: boolean;
@@ -53,6 +54,7 @@ interface GroupContextData {
 }
 
 export class QuestionAnalyzer {
+    private conversationManager: ConversationManager | null;
     private summationModel: BaseChatModel;
     private chatModel: BaseChatModel;
     private spModel: BaseChatModel;
@@ -80,17 +82,22 @@ export class QuestionAnalyzer {
 
 
     constructor(
+        conversationManager: ConversationManager | null,
         utilityModel: BaseChatModel, 
         summationModel: BaseChatModel, 
         chatModel: BaseChatModel,
         spModel: BaseChatModel,
         flowId: string
     ) {
+        this.conversationManager = conversationManager;
         this.utilityModel = utilityModel;
         this.summationModel = summationModel;
         this.chatModel = chatModel;
         this.spModel = spModel;
         this.flowId = flowId;
+    }
+    public setConversationManager(conversationManager: ConversationManager) {
+        this.conversationManager = conversationManager;
     }
 
     /**
@@ -632,11 +639,34 @@ export class QuestionAnalyzer {
         // Stage 1: Quick binary classification
         const isLikelyQuestion = await this.quickClassifyQuestion(message);
 
-        if (!isLikelyQuestion) {
-            logDebug(methodName, 'Quick classification determined not a question');
-            return this.getNotQuestionResult(message);
+         // Even if it's not a question, check if it's suitable for pattern processing
+         if (!isLikelyQuestion && message.length > 400) {
+            // Add null check before calling shouldSuggestPattern
+            if (this.conversationManager) {
+                try {
+                    const shouldSuggestPattern = await this.conversationManager.shouldSuggestPattern(
+                        message, 'statement', context
+                    );
+                    
+                    if (shouldSuggestPattern) {
+                        // Adjust the analysis result to recommend pattern processing
+                        return {
+                            isQuestion: false,
+                            confidence: 0.8,
+                            possibleTargets: [],
+                            sensitivity: 'low',
+                            knowledgeRequired: 'general',
+                            recommendedAction: 'offer_help', // This will get the bot to respond
+                            requiresRagMode: false,
+                            reasoning: 'Content appears suitable for pattern-based processing'
+                        };
+                    }
+                } catch (error) {
+                    console.warn(`[analyzeQuestionProgressively] Error checking pattern suggestion:`, error);
+                    // Continue with normal analysis if pattern check fails
+                }
+            }
         }
-
         // Stage 2: Full analysis for likely questions
         logDebug(methodName, 'Quick classification identified potential question, proceeding with full analysis');
         return this.analyzeQuestion(message, context, chatHistory, groupMembers);
